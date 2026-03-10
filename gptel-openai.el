@@ -46,7 +46,7 @@
                                     (:include gptel-openai))
   token)
 
-(defconst gptel--openai-chatgpt-client-id "app_EMoamEEZ73f0CkXaXp7hrann")
+(defconst gptel--openai-chatgpt-client-id "app_e2ecf3a3_78ae_1077_27ec_228a03421a0e")
 (defconst gptel--openai-chatgpt-issuer "https://auth.openai.com")
 (defconst gptel--openai-chatgpt-safety-margin 30
   "Seconds before expiry when ChatGPT OAuth tokens are refreshed.")
