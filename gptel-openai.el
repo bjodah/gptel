@@ -420,7 +420,7 @@ access.  Tokens are cached in `gptel-openai-chatgpt-token-file'."
           (protocol "https")
           (endpoint "/backend-api/codex/responses")
           (models '(gpt-5.1-codex-max gpt-5.1-codex-mini gpt-5.1-codex
-                    gpt-5.2 gpt-5.2-codex gpt-5.3-codex)))
+                    gpt-5.2 gpt-5.2-codex gpt-5.3-codex gpt-5.4)))
   "Register a ChatGPT Plus/Pro OAuth backend for gptel with NAME.
 
 This backend uses ChatGPT OAuth tokens (not OpenAI API keys) and
