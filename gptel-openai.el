@@ -45,7 +45,13 @@
                                     (:include gptel-openai))
   token)
 
-(defconst gptel--openai-chatgpt-client-id "app_e2ecf3a3_78ae_1077_27ec_228a03421a0e")
+(defcustom gptel-openai-chatgpt-client-id "app_EMoamEEZ73f0CkXaXp7hrann"
+  "Public OAuth client id used for ChatGPT device login.
+
+OpenAI may rotate this identifier.  If ChatGPT login starts failing
+with an `invalid_client' error, update this value."
+  :type 'string
+  :group 'gptel)
 (defconst gptel--openai-chatgpt-issuer "https://auth.openai.com")
 (defconst gptel--openai-chatgpt-safety-margin 30
   "Seconds before expiry when ChatGPT OAuth tokens are refreshed.")
@@ -154,6 +160,14 @@ otherwise DATA is JSON-encoded.  Return plist with keys :status,
           (when (string-match "\"organizations\"[ \t\n\r]*:[ \t\n\r]*\\[[^]]*\"id\"[ \t\n\r]*:[ \t\n\r]*\"\\([^\"]+\\)\"" payload)
             (match-string 1 payload))))))
 
+(defun gptel--openai-chatgpt-login-prompt (user-code)
+  "Return minibuffer instructions for ChatGPT device USER-CODE."
+  (format
+   (concat "Enter code %s at %s/codex/device. "
+           "Approve it in your browser, then return to Emacs and press ENTER. "
+           "If the browser opens a callback page afterward, you can ignore it and close the tab. ")
+   user-code gptel--openai-chatgpt-issuer))
+
 (defun gptel--openai-chatgpt-refresh-token (backend)
   "Refresh OAuth token for ChatGPT BACKEND."
   (let* ((token (gptel-openai-chatgpt-token backend))
@@ -162,10 +176,9 @@ otherwise DATA is JSON-encoded.  Return plist with keys :status,
       (user-error "Missing ChatGPT refresh token. Run `M-x gptel-openai-chatgpt-login'"))
     (let* ((resp (gptel--openai-chatgpt-request
                   (concat gptel--openai-chatgpt-issuer "/oauth/token")
-                  (gptel--openai-chatgpt-form-encode
-                   `(("grant_type" . "refresh_token")
-                     ("refresh_token" . ,refresh-token)
-                     ("client_id" . ,gptel--openai-chatgpt-client-id)))
+                  `(("grant_type" . "refresh_token")
+                    ("refresh_token" . ,refresh-token)
+                    ("client_id" . ,gptel-openai-chatgpt-client-id))
                   nil t))
            (status (plist-get resp :status))
            (body (plist-get resp :body)))
@@ -317,7 +330,7 @@ access.  Tokens are cached in `gptel-openai-chatgpt-token-file'."
          (device-resp
           (gptel--openai-chatgpt-request
            (concat gptel--openai-chatgpt-issuer "/api/accounts/deviceauth/usercode")
-           `(:client_id ,gptel--openai-chatgpt-client-id)
+           `(:client_id ,gptel-openai-chatgpt-client-id)
            `(("User-Agent" . ,(format "gptel/%s" (or emacs-version "emacs"))))))
          (device-body (plist-get device-resp :body))
          (status (plist-get device-resp :status)))
@@ -335,14 +348,10 @@ access.  Tokens are cached in `gptel-openai-chatgpt-token-file'."
       (if in-ssh-session
           (progn
             (message "ChatGPT device code: %s (copied to clipboard)" user-code)
-            (read-from-minibuffer
-             (format "Enter code %s at %s/codex/device in your local browser, then press ENTER to continue. "
-                     user-code gptel--openai-chatgpt-issuer)))
+            (read-from-minibuffer (gptel--openai-chatgpt-login-prompt user-code)))
         (message "ChatGPT code copied: %s" user-code)
         (browse-url (concat gptel--openai-chatgpt-issuer "/codex/device"))
-        (read-from-minibuffer
-         (format "Enter code %s at %s/codex/device, then press ENTER to continue. "
-                 user-code gptel--openai-chatgpt-issuer)))
+        (read-from-minibuffer (gptel--openai-chatgpt-login-prompt user-code)))
       (while (not auth-code)
         (let* ((poll-resp
                 (gptel--openai-chatgpt-request
@@ -366,12 +375,11 @@ access.  Tokens are cached in `gptel-openai-chatgpt-token-file'."
       (let* ((token-resp
               (gptel--openai-chatgpt-request
                (concat gptel--openai-chatgpt-issuer "/oauth/token")
-               (gptel--openai-chatgpt-form-encode
-                `(("grant_type" . "authorization_code")
-                  ("code" . ,auth-code)
-                  ("redirect_uri" . "https://auth.openai.com/deviceauth/callback")
-                  ("client_id" . ,gptel--openai-chatgpt-client-id)
-                  ("code_verifier" . ,code-verifier)))
+               `(("grant_type" . "authorization_code")
+                 ("code" . ,auth-code)
+                 ("redirect_uri" . "https://auth.openai.com/deviceauth/callback")
+                 ("client_id" . ,gptel-openai-chatgpt-client-id)
+                 ("code_verifier" . ,code-verifier))
                nil t))
              (token-status (plist-get token-resp :status))
              (token (plist-get token-resp :body)))

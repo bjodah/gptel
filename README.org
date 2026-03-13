@@ -200,7 +200,7 @@ gptel supports a number of LLM providers:
 #+html: <div align="center">
 | LLM Backend          | Requires                   |
 |----------------------+----------------------------|
-| ChatGPT              | [[https://platform.openai.com/account/api-keys][API key]]                    |
+| ChatGPT              | [[https://platform.openai.com/account/api-keys][API key]] or ChatGPT Plus/Pro login |
 | Anthropic (Claude)   | [[https://www.anthropic.com/api][API key]]                    |
 | Gemini               | [[https://makersuite.google.com/app/apikey][API key]]                    |
 | Ollama               | [[https://ollama.ai/][Ollama running locally]]     |
@@ -237,6 +237,34 @@ Optional: Set =gptel-api-key= to the key. Alternatively, you may choose a more s
 
 - Setting it to a custom function that returns the key.
 - Leaving it set to the default =gptel-api-key-from-auth-source= function which reads keys from =~/.authinfo=. (See [[#optional-securing-api-keys-with-authinfo][authinfo details]])
+
+**** ChatGPT Plus/Pro OAuth backend
+
+If you want to use ChatGPT Codex access instead of an OpenAI API key,
+register the OAuth backend explicitly:
+
+#+begin_src emacs-lisp
+(require 'gptel-openai)
+(gptel-make-openai-chatgpt "ChatGPT-Codex")
+(gptel-openai-chatgpt-login)
+#+end_src
+
+This uses OpenAI's device-code login flow:
+
+1. =gptel-openai-chatgpt-login= opens =https://auth.openai.com/codex/device=
+   and copies a one-time code to the clipboard.
+2. Enter the code in your browser and approve access for your ChatGPT
+   account.
+3. Return to Emacs and press =RET= to let gptel finish the token
+   exchange.
+
+You do /not/ need to create or copy any token manually from the OpenAI
+web UI for this flow.
+
+If your browser opens a callback page after approval, or prompts for
+credentials for that callback, you can ignore it and close the tab.
+gptel completes the login back in Emacs and stores the OAuth token in
+=gptel-openai-chatgpt-token-file=.
 
 *** Other LLM backends
 
