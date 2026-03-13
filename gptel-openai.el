@@ -417,11 +417,13 @@ access.  Tokens are cached in `gptel-openai-chatgpt-token-file'."
   "Register a ChatGPT Plus/Pro OAuth backend for gptel with NAME.
 
 This backend uses ChatGPT OAuth tokens (not OpenAI API keys) and
-targets the Codex endpoint on chatgpt.com.  Run
+targets the Codex endpoint on chatgpt.com.  This endpoint always uses
+streaming responses, so STREAM defaults to non-nil.  Run
 `gptel-openai-chatgpt-login' once to authenticate.
 
 For keyword argument meanings, see `gptel-make-openai'."
   (declare (indent 1))
+  (setq stream t)
   (let ((backend (gptel--make-openai-chatgpt
                   :curl-args curl-args
                   :name name

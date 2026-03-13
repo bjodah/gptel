@@ -69,6 +69,11 @@
   token creation is required in the browser, and that any callback page
   opened after device-code approval can be ignored.
 
+- ChatGPT Codex backends now force streaming on.  The Codex endpoint
+  returns Server-Sent Events, so non-streaming mode was wiring up the
+  wrong response callback and could leak raw SSE payloads into the chat
+  buffer.
+
 - ~gptel-backend~ can now be set from customize buffers.  These are
   produced by, for example, =M-x customize-group ⮐ gptel=.  Previously
   ~gptel-backend~ was displayed in a read-only way, and could even break

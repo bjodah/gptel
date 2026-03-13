@@ -266,6 +266,10 @@ credentials for that callback, you can ignore it and close the tab.
 gptel completes the login back in Emacs and stores the OAuth token in
 =gptel-openai-chatgpt-token-file=.
 
+Note: this ChatGPT Codex backend is streaming-only.  It always uses
+streaming responses, so setting =gptel-stream= to =nil= is not
+supported for this backend.
+
 *** Other LLM backends
 
 ChatGPT is configured out of the box.  If you want to use other LLM backends (like Ollama, Claude/Anthropic or Gemini) you need to register and configure them first.
