@@ -26,6 +26,8 @@
 (eval-when-compile (require 'cl-lib))
 (require 'map)
 (eval-and-compile (require 'gptel-request))
+(require 'browse-url)
+(require 'url-util)
 
 (defvar json-object-type)
 (defvar gptel-mode)
@@ -37,6 +39,667 @@
 (cl-defstruct (gptel-openai (:constructor gptel--make-openai)
                             (:copier nil)
                             (:include gptel-backend)))
+
+(cl-defstruct (gptel-openai-chatgpt (:constructor gptel--make-openai-chatgpt)
+                                    (:copier nil)
+                                    (:include gptel-openai))
+  token)
+
+(defcustom gptel-openai-chatgpt-client-id "app_EMoamEEZ73f0CkXaXp7hrann"
+  "Public OAuth client id used for ChatGPT device login.
+
+OpenAI may rotate this identifier.  If ChatGPT login starts failing
+with an `invalid_client' error, update this value."
+  :type 'string
+  :group 'gptel)
+(defconst gptel--openai-chatgpt-issuer "https://auth.openai.com")
+(defconst gptel--openai-chatgpt-safety-margin 30
+  "Seconds before expiry when ChatGPT OAuth tokens are refreshed.")
+
+(defcustom gptel-openai-chatgpt-token-file
+  (expand-file-name ".cache/gptel/chatgpt-token" user-emacs-directory)
+  "File where ChatGPT OAuth tokens are cached for gptel backends."
+  :type 'file
+  :group 'gptel)
+
+(defcustom gptel-openai-chatgpt-instructions
+  "You are a coding assistant."
+  "Default instructions sent to ChatGPT Codex OAuth backend.
+
+If `gptel--system-message' is non-nil for a request, it is used
+instead."
+  :type 'string
+  :group 'gptel)
+
+(defun gptel--openai-chatgpt-backend (&optional backend)
+  "Return ChatGPT OAuth backend.
+
+If BACKEND is non-nil, return it after verifying it is a
+`gptel-openai-chatgpt' backend.  Otherwise use `gptel-backend', then
+fall back to the first known ChatGPT OAuth backend."
+  (cond
+   ((and backend (gptel-openai-chatgpt-p backend)) backend)
+   ((and (boundp 'gptel-backend)
+         gptel-backend
+         (gptel-openai-chatgpt-p gptel-backend))
+    gptel-backend)
+   ((let (found)
+      (dolist (backend (mapcar #'cdr gptel--known-backends) found)
+        (when (gptel-openai-chatgpt-p backend)
+          (setq found backend)))))
+   (t (user-error "No ChatGPT OAuth backend found. Use `gptel-make-openai-chatgpt' first"))))
+
+(defun gptel--openai-chatgpt-save-token (token)
+  "Persist ChatGPT OAuth TOKEN to `gptel-openai-chatgpt-token-file'."
+  (let ((print-length nil)
+        (print-level nil)
+        (coding-system-for-write 'utf-8-unix))
+    (make-directory (file-name-directory gptel-openai-chatgpt-token-file) t)
+    (write-region (prin1-to-string token) nil gptel-openai-chatgpt-token-file nil :silent)
+    token))
+
+(defun gptel--openai-chatgpt-restore-token ()
+  "Restore ChatGPT OAuth token from `gptel-openai-chatgpt-token-file'."
+  (when (file-exists-p gptel-openai-chatgpt-token-file)
+    (let ((coding-system-for-read 'utf-8-auto-dos))
+      (with-temp-buffer
+        (set-buffer-multibyte nil)
+        (insert-file-contents-literally gptel-openai-chatgpt-token-file)
+        (goto-char (point-min))
+        (read (current-buffer))))))
+
+(defun gptel--openai-chatgpt-form-encode (pairs)
+  "URL encode alist PAIRS as x-www-form-urlencoded data."
+  (mapconcat
+   (lambda (pair)
+     (format "%s=%s"
+             (url-hexify-string (car pair))
+             (url-hexify-string (cdr pair))))
+   pairs "&"))
+
+(defun gptel--openai-chatgpt-request (url data headers &optional form-encoded)
+  "POST DATA to URL with HEADERS and return a plist response.
+
+If FORM-ENCODED is non-nil, DATA is sent as x-www-form-urlencoded;
+otherwise DATA is JSON-encoded.  Return plist with keys :status,
+:body and :raw."
+  (gptel--url-retrieve
+      url
+    :method 'post
+    :data (if (and form-encoded (not (stringp data)))
+              (gptel--openai-chatgpt-form-encode data)
+            data)
+    :headers headers
+    :content-type (if form-encoded
+                      "application/x-www-form-urlencoded"
+                    "application/json")
+    :return-response t))
+
+(defun gptel--openai-chatgpt-base64url-decode (input)
+  "Decode base64url INPUT and return a decoded string."
+  (let* ((base64 (replace-regexp-in-string "_" "/"
+                   (replace-regexp-in-string "-" "+" input)))
+         (padding (mod (- 4 (mod (length base64) 4)) 4))
+         (padded (concat base64 (make-string padding ?=))))
+    (decode-coding-string (base64-decode-string padded) 'utf-8 t)))
+
+(defun gptel--openai-chatgpt-jwt-payload (jwt)
+  "Return decoded JWT payload string from JWT, or nil."
+  (when (and (stringp jwt) (string-match-p "\\.`[^.]+\\.[^.]+\\.[^.]+\\'" jwt))
+    (condition-case nil
+        (gptel--openai-chatgpt-base64url-decode (cadr (split-string jwt "\\.")))
+      (error nil))))
+
+(defun gptel--openai-chatgpt-extract-account-id (token)
+  "Extract ChatGPT account id from OAuth TOKEN payload."
+  (let* ((payload (or (gptel--openai-chatgpt-jwt-payload (plist-get token :id_token))
+                      (gptel--openai-chatgpt-jwt-payload (plist-get token :access_token)))))
+    (when payload
+      (or (when (string-match "\"chatgpt_account_id\"[ \t\n\r]*:[ \t\n\r]*\"\\([^\"]+\\)\"" payload)
+            (match-string 1 payload))
+          (when (string-match "\"organizations\"[ \t\n\r]*:[ \t\n\r]*\\[[^]]*\"id\"[ \t\n\r]*:[ \t\n\r]*\"\\([^\"]+\\)\"" payload)
+            (match-string 1 payload))))))
+
+(defun gptel--openai-chatgpt-login-prompt (user-code)
+  "Return minibuffer instructions for ChatGPT device USER-CODE."
+  (format
+   (concat "Enter code %s at %s/codex/device. "
+           "Approve it in your browser, then return to Emacs and press ENTER. "
+           "If the browser opens a callback page afterward, you can ignore it and close the tab. ")
+   user-code gptel--openai-chatgpt-issuer))
+
+(defun gptel--openai-chatgpt-refresh-token (backend)
+  "Refresh OAuth token for ChatGPT BACKEND."
+  (let* ((token (gptel-openai-chatgpt-token backend))
+         (refresh-token (plist-get token :refresh_token)))
+    (unless refresh-token
+      (user-error "Missing ChatGPT refresh token. Run `M-x gptel-openai-chatgpt-login'"))
+    (let* ((resp (gptel--openai-chatgpt-request
+                  (concat gptel--openai-chatgpt-issuer "/oauth/token")
+                  `(("grant_type" . "refresh_token")
+                    ("refresh_token" . ,refresh-token)
+                    ("client_id" . ,gptel-openai-chatgpt-client-id))
+                  nil t))
+           (status (plist-get resp :status))
+           (body (plist-get resp :body)))
+      (unless (and (eql status 200) body)
+        (user-error "Failed to refresh ChatGPT token (HTTP %s): %s"
+                    status
+                    (or (plist-get body :error)
+                        (plist-get body :error_description)
+                        (plist-get resp :raw))))
+      (unless (plist-get body :refresh_token)
+        (plist-put body :refresh_token refresh-token))
+      (plist-put body :account_id (or (gptel--openai-chatgpt-extract-account-id body)
+                                      (plist-get token :account_id)))
+      (plist-put body :expires_at
+                 (+ (float-time) (or (plist-get body :expires_in) 3600)
+                    (- gptel--openai-chatgpt-safety-margin)))
+      (setf (gptel-openai-chatgpt-token backend) body)
+      (gptel--openai-chatgpt-save-token body)
+      body)))
+
+(defun gptel--openai-chatgpt-ensure-token (&optional backend)
+  "Ensure ChatGPT OAuth token exists and is valid for BACKEND."
+  (let* ((backend (gptel--openai-chatgpt-backend backend))
+         (token (or (gptel-openai-chatgpt-token backend)
+                    (gptel--openai-chatgpt-restore-token))))
+    (unless token
+      (if noninteractive
+          (user-error "No ChatGPT token found. Run `M-x gptel-openai-chatgpt-login' first")
+        (gptel-openai-chatgpt-login backend)
+        (setq token (gptel-openai-chatgpt-token backend))))
+    (setf (gptel-openai-chatgpt-token backend) token)
+    (when (<= (or (plist-get token :expires_at) 0)
+              (+ (float-time) gptel--openai-chatgpt-safety-margin))
+      (setq token (gptel--openai-chatgpt-refresh-token backend)))
+    token))
+
+(defun gptel--openai-chatgpt-header ()
+  "Return headers for ChatGPT OAuth requests."
+  (let* ((token (gptel--openai-chatgpt-ensure-token))
+         (headers
+          `(("Authorization" . ,(concat "Bearer " (plist-get token :access_token)))
+            ("originator" . "gptel"))))
+    (when-let* ((account-id (plist-get token :account_id)))
+      (push (cons "ChatGPT-Account-Id" account-id) headers))
+    headers))
+
+(defun gptel--openai-chatgpt-plist-remove-keys (plist keys)
+  "Return copy of PLIST without properties in KEYS."
+  (let (result)
+    (while plist
+      (let ((k (pop plist))
+            (v (pop plist)))
+        (unless (memq k keys)
+          (setq result (append result (list k v))))))
+    result))
+
+(defun gptel--openai-chatgpt-response-text (response)
+  "Extract response text from RESPONSE object.
+
+RESPONSE can be either a full response object or a wrapper containing
+it in :response."
+  (let* ((obj (or (plist-get response :response) response))
+         (direct (plist-get obj :output_text)))
+    (or (and (stringp direct) direct)
+        (when-let* ((output (plist-get obj :output))
+                    ((vectorp output)))
+          (mapconcat
+           #'identity
+           (delq nil
+                 (mapcar
+                  (lambda (item)
+                    (when-let* ((content (plist-get item :content))
+                                ((vectorp content)))
+                      (mapconcat
+                       #'identity
+                       (delq nil
+                             (mapcar
+                              (lambda (part)
+                                (or (and (string= (plist-get part :type) "output_text")
+                                         (plist-get part :text))
+                                    (and (stringp (plist-get part :text))
+                                         (plist-get part :text))))
+                              content))
+                       "")))
+                  output))
+           "\n")))))
+
+(defun gptel--openai-chatgpt-wrap-content (content item-type)
+  "Wrap CONTENT as Responses API content items of ITEM-TYPE."
+  (cl-flet ((convert-part (part)
+              (pcase (plist-get part :type)
+                ("text" (list :type item-type :text (plist-get part :text)))
+                ("image_url"
+                 (list :type "input_image"
+                       :image_url (plist-get (plist-get part :image_url) :url)))
+                (_ part))))
+    (cond
+     ((stringp content)
+      (vector (list :type item-type :text content)))
+     ((or (vectorp content)
+          (and (listp content) (plist-get (car-safe content) :type)))
+      (vconcat (mapcar #'convert-part content)))
+     (t (vector (list :type item-type :text (format "%s" content)))))))
+
+(defun gptel--openai-chatgpt-tool-call-item (tool-call)
+  "Convert TOOL-CALL into a Responses API function call item."
+  (list :type "function_call"
+        :call_id (plist-get tool-call :id)
+        :name (plist-get tool-call :name)
+        :arguments (gptel--json-encode (or (plist-get tool-call :args) []))))
+
+(defun gptel--openai-chatgpt-tool-result-item (tool-call)
+  "Convert TOOL-CALL result into a Responses API function call output item."
+  (list :type "function_call_output"
+        :call_id (plist-get tool-call :id)
+        :output (plist-get tool-call :result)))
+
+(defun gptel--openai-chatgpt-response-item-p (item)
+  "Return non-nil when ITEM is already a Responses API input item."
+  (or (plist-get item :type)
+      (and (member (plist-get item :role) '("user" "assistant"))
+           (when-let* ((content (plist-get item :content))
+                       ((vectorp content))
+                       ((> (length content) 0))
+                       (part (aref content 0))
+                       (type (plist-get part :type)))
+             (member type '("input_text" "output_text" "input_image"
+                            "input_file" "refusal"))))))
+
+(defun gptel--openai-chatgpt-message-items (message)
+  "Convert MESSAGE into a list of Responses API input items."
+  (cond
+   ((gptel--openai-chatgpt-response-item-p message)
+    (list message))
+   (t
+    (let ((role (plist-get message :role))
+          (content (plist-get message :content))
+          (tool-calls (plist-get message :tool_calls)))
+      (cond
+       ((equal role "system") nil)
+       ((equal role "tool")
+        (list (list :type "function_call_output"
+                    :call_id (plist-get message :tool_call_id)
+                    :output (or content ""))))
+       (tool-calls
+        (append
+         (when (and content (not (eq content :null)))
+           (list (list :role "assistant"
+                       :content (gptel--openai-chatgpt-wrap-content
+                                 content "output_text"))))
+         (cl-loop for tool-call across tool-calls
+                  collect (list :type "function_call"
+                                :call_id (plist-get tool-call :id)
+                                :name (map-nested-elt tool-call '(:function :name))
+                                :arguments (or (map-nested-elt
+                                                tool-call '(:function :arguments))
+                                               "")))))
+       ((equal role "user")
+        (list (list :role "user"
+                    :content (gptel--openai-chatgpt-wrap-content
+                              content "input_text"))))
+       ((equal role "assistant")
+        (list (list :role "assistant"
+                    :content (gptel--openai-chatgpt-wrap-content
+                              content "output_text"))))
+       (t (list message)))))))
+
+(defun gptel--openai-chatgpt-prompts-to-input (prompts)
+  "Convert PROMPTS from chat messages to Responses API input items."
+  (vconcat
+   (apply #'append
+          (mapcar #'gptel--openai-chatgpt-message-items prompts))))
+
+(defun gptel--openai-chatgpt-convert-tools (tools)
+  "Convert chat-completions TOOLS into Responses API tool definitions."
+  (vconcat
+   (mapcar
+    (lambda (tool)
+      (pcase (plist-get tool :type)
+        ("function"
+         (let ((func (plist-get tool :function)))
+           (list :type "function"
+                 :name (plist-get func :name)
+                 :description (plist-get func :description)
+                 :parameters (plist-get func :parameters))))
+        (_ tool)))
+    tools)))
+
+(defun gptel--openai-chatgpt-insert-input-items (data items &optional position)
+  "Insert ITEMS into DATA's `:input' vector at POSITION."
+  (let* ((input (or (plist-get data :input) []))
+         (items (if (vectorp items) items (vconcat items))))
+    (pcase position
+      ('nil
+       (plist-put data :input (vconcat input items)))
+      ((pred integerp)
+       (when (< position 0) (setq position (+ (length input) position)))
+       (plist-put data :input
+                  (vconcat (substring input 0 position)
+                           items
+                           (substring input position)))))))
+
+(defun gptel--openai-chatgpt-inject-tool-use (info)
+  "Append collected tool calls from INFO to the pending request input."
+  (unless (plist-get info :chatgpt-tool-use-injected)
+    (when-let* ((tool-use (plist-get info :tool-use))
+                (backend (plist-get info :backend))
+                (data (plist-get info :data)))
+      (gptel--inject-prompt
+       backend data
+       (mapcar #'gptel--openai-chatgpt-tool-call-item tool-use))
+      (plist-put info :chatgpt-tool-use-injected t))))
+
+(defun gptel--openai-chatgpt-collect-response (response info)
+  "Collect text, metadata and tool calls from ChatGPT RESPONSE into INFO."
+  (let* ((obj (or (plist-get response :response) response))
+         (output (plist-get obj :output))
+         (chunks nil)
+         (tool-use nil))
+    (when-let* ((usage (plist-get obj :usage)))
+      (plist-put info :output-tokens (plist-get usage :output_tokens)))
+    (when-let* ((status (plist-get obj :status)))
+      (plist-put info :stop-reason status))
+    (when (vectorp output)
+      (cl-loop
+       for item across output
+       do
+       (pcase (plist-get item :type)
+         ("message"
+          (when-let* ((content (plist-get item :content)))
+            (cl-loop for part across content
+                     for type = (plist-get part :type)
+                     if (equal type "output_text")
+                     do (push (plist-get part :text) chunks)
+                     else if (equal type "refusal")
+                     do (push (format "[Refused: %s]" (plist-get part :refusal))
+                              chunks))))
+         ("function_call"
+          (push (list :id (plist-get item :call_id)
+                      :name (plist-get item :name)
+                      :args (ignore-errors
+                              (gptel--json-read-string
+                               (plist-get item :arguments))))
+                tool-use))
+         ("reasoning"
+          (when-let* ((summary (plist-get item :summary)))
+            (cl-loop for part across summary
+                     for text = (plist-get part :text)
+                     when text
+                     do (plist-put info :reasoning
+                                   (concat (plist-get info :reasoning) text)))))
+         ("code_interpreter_call"
+          (when-let* ((results (plist-get item :results)))
+            (cl-loop for result across results
+                     when (equal (plist-get result :type) "logs")
+                     do (push (format "\n```\n%s\n```" (plist-get result :logs))
+                              chunks)))))))
+    (when tool-use
+      (plist-put info :tool-use (nreverse tool-use)))
+    (when chunks
+      (apply #'concat (nreverse chunks)))))
+
+(cl-defmethod gptel--request-data ((backend gptel-openai-chatgpt) prompts)
+  "Build request payload for ChatGPT Codex endpoint.
+
+This endpoint is Responses-API compatible and requires `instructions',
+`store: false' and streaming mode."
+  (let* ((payload
+          `(:model ,(gptel--model-name gptel-model)
+            :input ,(gptel--openai-chatgpt-prompts-to-input prompts)
+            :instructions
+            ,(or (and (stringp gptel--system-message)
+                      (not (string-empty-p gptel--system-message))
+                      gptel--system-message)
+                 gptel-openai-chatgpt-instructions)
+            :store :json-false
+            :stream t))
+         (reasoning-model-p
+          (memq gptel-model '(o1 o1-preview o1-mini o3-mini o3 o4-mini
+                                 gpt-5 gpt-5-mini gpt-5-nano gpt-5.1 gpt-5.2))))
+    (when gptel-use-tools
+      (when-let* ((tools (and gptel-tools
+                              (gptel--openai-chatgpt-convert-tools
+                               (gptel--parse-tools backend gptel-tools)))))
+        (when (> (length tools) 0)
+          (plist-put payload :tools tools)))
+      (when (eq gptel-use-tools 'force)
+        (plist-put payload :tool_choice "required")))
+    (when gptel-max-tokens
+      (plist-put payload :max_output_tokens gptel-max-tokens))
+    (when gptel--schema
+      (plist-put payload :text
+                 (list :format
+                       (list :type "json_schema"
+                             :name (md5 (format "%s" (random)))
+                             :schema (gptel--preprocess-schema
+                                      (gptel--dispatch-schema-type gptel--schema))
+                             :strict t))))
+    (setq payload
+          (gptel--merge-plists
+           payload
+           gptel--request-params
+           (gptel-backend-request-params gptel-backend)
+           (gptel--model-request-params gptel-model)))
+    ;; ChatGPT's Codex Responses endpoint rejects `temperature'.
+    (setq payload (gptel--openai-chatgpt-plist-remove-keys payload '(:temperature)))
+    payload))
+
+(cl-defmethod gptel-curl--parse-stream ((_backend gptel-openai-chatgpt) info)
+  "Parse ChatGPT Codex streaming responses and return text delta."
+  (let (chunks)
+    (condition-case nil
+        (while (re-search-forward "^data:" nil t)
+          (save-match-data
+            (if (looking-at " *\\[DONE\\]")
+                (progn
+                  (when (plist-get info :tool-use)
+                    (plist-put info :tool-use (nreverse (plist-get info :tool-use))))
+                  (when (and (not (plist-get info :tool-use))
+                             (plist-get info :chatgpt-response))
+                    (when-let* ((text (gptel--openai-chatgpt-collect-response
+                                       (plist-get info :chatgpt-response) info))
+                                ((not (or chunks (plist-get info :chatgpt-seen-delta)))))
+                      (push text chunks)))
+                  (gptel--openai-chatgpt-inject-tool-use info))
+              (when-let* ((response (gptel--json-read))
+                          (type (plist-get response :type)))
+                (cond
+                 ((string= type "response.output_text.delta")
+                  (when-let* ((delta (plist-get response :delta)))
+                    (plist-put info :chatgpt-seen-delta t)
+                    (push delta chunks)))
+                 ((string= type "response.function_call_arguments.delta")
+                  (plist-put info :chatgpt-seen-tool-call t))
+                 ((string= type "response.output_item.done")
+                  (when-let* ((item (plist-get response :item))
+                              ((equal (plist-get item :type) "function_call")))
+                    (plist-put info :chatgpt-seen-tool-call t)
+                    (plist-put
+                     info :tool-use
+                     (cons (list :id (plist-get item :call_id)
+                                 :name (plist-get item :name)
+                                 :args (ignore-errors
+                                         (gptel--json-read-string
+                                          (plist-get item :arguments))))
+                           (plist-get info :tool-use)))))
+                 ((string= type "response.reasoning_summary_text.delta")
+                  (when-let* ((delta (plist-get response :delta)))
+                    (plist-put info :reasoning
+                               (concat (plist-get info :reasoning) delta))))
+                 ((string= type "response.completed")
+                  (plist-put info :chatgpt-response response)
+                  (when-let* ((obj (plist-get response :response)))
+                    (when-let* ((usage (plist-get obj :usage)))
+                      (plist-put info :output-tokens (plist-get usage :output_tokens)))
+                    (when-let* ((status (plist-get obj :status)))
+                      (plist-put info :stop-reason status))
+                    ;; ChatGPT's stream ends at `response.completed'; there may
+                    ;; be no trailing `data: [DONE]` marker. Ensure tool calls
+                    ;; captured in this turn are injected before tool outputs
+                    ;; are appended on the continuation request.
+                    (when-let* ((output (plist-get obj :output))
+                                ((vectorp output))
+                                ((cl-find-if (lambda (item)
+                                               (equal (plist-get item :type)
+                                                      "function_call"))
+                                             output)))
+                      (unless (plist-get info :tool-use)
+                        (gptel--openai-chatgpt-collect-response response info))
+                      (gptel--openai-chatgpt-inject-tool-use info)))
+                  (when-let* ((text (gptel--openai-chatgpt-response-text response))
+                              ((not (string-empty-p text))))
+                    (unless (or chunks
+                                (plist-get info :chatgpt-seen-delta)
+                                (plist-get info :chatgpt-seen-tool-call))
+                      (push text chunks)))))))))
+      (error (goto-char (match-beginning 0))))
+    (apply #'concat (nreverse chunks))))
+
+(cl-defmethod gptel--parse-response ((_backend gptel-openai-chatgpt) response info)
+  "Parse non-streaming ChatGPT Codex RESPONSE and return response text."
+  (prog1
+      (gptel--openai-chatgpt-collect-response response info)
+    (gptel--openai-chatgpt-inject-tool-use info)))
+
+(cl-defmethod gptel--inject-prompt ((_backend gptel-openai-chatgpt) data new-prompt
+                                    &optional position)
+  "Inject NEW-PROMPT into DATA's `:input' array at POSITION."
+  (when (keywordp (car-safe new-prompt))
+    (setq new-prompt (list new-prompt)))
+  (gptel--openai-chatgpt-insert-input-items
+   data
+   (apply #'append
+          (mapcar #'gptel--openai-chatgpt-message-items new-prompt))
+   position))
+
+;;;###autoload
+(defun gptel-openai-chatgpt-login (&optional backend)
+  "Login to ChatGPT OAuth for gptel backend BACKEND.
+
+Uses the headless device flow compatible with ChatGPT Plus/Pro Codex
+access.  Tokens are cached in `gptel-openai-chatgpt-token-file'."
+  (interactive)
+  (let* ((backend (gptel--openai-chatgpt-backend backend))
+         (in-ssh-session (or (getenv "SSH_CLIENT")
+                             (getenv "SSH_CONNECTION")
+                             (getenv "SSH_TTY")))
+         (device-resp
+          (gptel--openai-chatgpt-request
+           (concat gptel--openai-chatgpt-issuer "/api/accounts/deviceauth/usercode")
+           `(:client_id ,gptel-openai-chatgpt-client-id)
+           `(("User-Agent" . ,(format "gptel/%s" (or emacs-version "emacs"))))))
+         (device-body (plist-get device-resp :body))
+         (status (plist-get device-resp :status)))
+    (unless (and (eql status 200) device-body)
+      (user-error "Failed to start ChatGPT login (HTTP %s): %s"
+                  status (or (plist-get device-resp :raw) "unknown response")))
+    (let* ((device-auth-id (plist-get device-body :device_auth_id))
+           (user-code (plist-get device-body :user_code))
+           (interval (max 1 (truncate (string-to-number (or (plist-get device-body :interval) "5")))))
+           auth-code
+           code-verifier)
+      (unless (and device-auth-id user-code)
+        (user-error "ChatGPT login response missing device auth fields"))
+      (gui-set-selection 'CLIPBOARD user-code)
+      (if in-ssh-session
+          (progn
+            (message "ChatGPT device code: %s (copied to clipboard)" user-code)
+            (read-from-minibuffer (gptel--openai-chatgpt-login-prompt user-code)))
+        (message "ChatGPT code copied: %s" user-code)
+        (browse-url (concat gptel--openai-chatgpt-issuer "/codex/device"))
+        (read-from-minibuffer (gptel--openai-chatgpt-login-prompt user-code)))
+      (while (not auth-code)
+        (let* ((poll-resp
+                (gptel--openai-chatgpt-request
+                 (concat gptel--openai-chatgpt-issuer "/api/accounts/deviceauth/token")
+                 `(:device_auth_id ,device-auth-id :user_code ,user-code)
+                 `(("User-Agent" . ,(format "gptel/%s" (or emacs-version "emacs"))))))
+               (poll-status (plist-get poll-resp :status))
+               (poll-body (plist-get poll-resp :body)))
+          (cond
+           ((and (eql poll-status 200) poll-body)
+            (setq auth-code (plist-get poll-body :authorization_code)
+                  code-verifier (plist-get poll-body :code_verifier)))
+           ((memq poll-status '(403 404))
+            (sleep-for (+ interval 3)))
+           (t
+            (user-error "ChatGPT authorization failed (HTTP %s): %s"
+                        poll-status
+                        (or (plist-get poll-resp :raw) "unknown response"))))))
+      (unless (and auth-code code-verifier)
+        (user-error "ChatGPT authorization did not return exchange credentials"))
+      (let* ((token-resp
+              (gptel--openai-chatgpt-request
+               (concat gptel--openai-chatgpt-issuer "/oauth/token")
+               `(("grant_type" . "authorization_code")
+                 ("code" . ,auth-code)
+                 ("redirect_uri" . "https://auth.openai.com/deviceauth/callback")
+                 ("client_id" . ,gptel-openai-chatgpt-client-id)
+                 ("code_verifier" . ,code-verifier))
+               nil t))
+             (token-status (plist-get token-resp :status))
+             (token (plist-get token-resp :body)))
+        (unless (and (eql token-status 200) token)
+          (user-error "ChatGPT token exchange failed (HTTP %s): %s"
+                      token-status
+                      (or (plist-get token-resp :raw) "unknown response")))
+        (plist-put token :account_id (gptel--openai-chatgpt-extract-account-id token))
+        (plist-put token :expires_at
+                   (+ (float-time) (or (plist-get token :expires_in) 3600)
+                      (- gptel--openai-chatgpt-safety-margin)))
+        (setf (gptel-openai-chatgpt-token backend) token)
+        (gptel--openai-chatgpt-save-token token)
+        (message "Successfully logged in to ChatGPT for gptel.")))))
+
+;;;###autoload
+(defun gptel-openai-chatgpt-logout (&optional backend)
+  "Clear cached ChatGPT OAuth credentials for BACKEND."
+  (interactive)
+  (let ((backend (gptel--openai-chatgpt-backend backend)))
+    (setf (gptel-openai-chatgpt-token backend) nil)
+    (when (file-exists-p gptel-openai-chatgpt-token-file)
+      (delete-file gptel-openai-chatgpt-token-file))
+    (message "Cleared ChatGPT OAuth credentials.")))
+
+;;;###autoload
+(cl-defun gptel-make-openai-chatgpt
+    (name &key curl-args request-params stream
+          (header #'gptel--openai-chatgpt-header)
+          (host "chatgpt.com")
+          (protocol "https")
+          (endpoint "/backend-api/codex/responses")
+          (models '(gpt-5.1-codex-max gpt-5.1-codex-mini gpt-5.1-codex
+                    gpt-5.2 gpt-5.2-codex gpt-5.3-codex gpt-5.4)))
+  "Register a ChatGPT Plus/Pro OAuth backend for gptel with NAME.
+
+This backend uses ChatGPT OAuth tokens (not OpenAI API keys) and
+targets the Codex endpoint on chatgpt.com.  This endpoint always uses
+streaming responses, so STREAM defaults to non-nil.  Run
+`gptel-openai-chatgpt-login' once to authenticate.
+
+For keyword argument meanings, see `gptel-make-openai'."
+  (declare (indent 1))
+  (setq stream t)
+  (let ((backend (gptel--make-openai-chatgpt
+                  :curl-args curl-args
+                  :name name
+                  :host host
+                  :header header
+                  :key nil
+                  :models (gptel--process-models models)
+                  :protocol protocol
+                  :endpoint endpoint
+                  :stream stream
+                  :request-params request-params
+                  :url (if protocol
+                           (concat protocol "://" host endpoint)
+                         (concat host endpoint)))))
+    (prog1 backend
+      (setf (alist-get name gptel--known-backends nil nil #'equal)
+            backend))))
 
 ;; How the following function works:
 ;;
@@ -230,6 +893,32 @@ Mutate state INFO with response metadata."
 ;; NOTE: No `gptel--parse-tools' method required for gptel-openai, since this is
 ;; handled by its defgeneric implementation
 
+(cl-defmethod gptel--inject-tool-call ((_backend gptel-openai-chatgpt)
+                                       data tool-call new-call)
+  "Replace TOOL-CALL in ChatGPT Codex request DATA with NEW-CALL."
+  (if-let* ((input (plist-get data :input))
+            (id (plist-get tool-call :id))
+            (index (cl-loop for item across input
+                            for i upfrom 0
+                            if (and (equal (plist-get item :type) "function_call")
+                                    (equal (plist-get item :call_id) id))
+                            return i
+                            finally return nil))
+            (call (aref input index)))
+      (if (null new-call)
+          (plist-put data :input
+                     (vconcat (substring input 0 index)
+                              (substring input (1+ index))))
+        (when-let* ((args (plist-get new-call :args)))
+          (plist-put call :arguments (gptel--json-encode args)))
+        (when-let* ((name (plist-get new-call :name)))
+          (plist-put call :name name)))
+    (display-warning
+     '(gptel tool-call)
+     (format "Could not inject updated tool-call arguments for tool call %s, %s"
+             (plist-get tool-call :name)
+             (truncate-string-to-width (prin1-to-string new-call) 50 nil nil t)))))
+
 (cl-defmethod gptel--inject-tool-call ((_backend gptel-openai) data tool-call new-call)
   "Replace TOOL-CALL in query DATA with NEW-CALL.
 
@@ -266,6 +955,10 @@ Completions API."
      (format "Could not inject updated tool-call arguments for tool call %s, %s"
              (plist-get tool-call :name)
              (truncate-string-to-width (prin1-to-string new-call) 50 nil nil t)))))
+
+(cl-defmethod gptel--parse-tool-results ((_backend gptel-openai-chatgpt) tool-use)
+  "Return Responses API tool result items for ChatGPT Codex TOOL-USE."
+  (mapcar #'gptel--openai-chatgpt-tool-result-item tool-use))
 
 (cl-defmethod gptel--parse-tool-results ((_backend gptel-openai) tool-use)
   "Return a prompt containing tool call results in TOOL-USE."

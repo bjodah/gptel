@@ -961,18 +961,49 @@ MODE-SYM is typically a major-mode symbol."
 
 (defvar url-http-end-of-headers)
 (defvar url-http-response-status)
-(cl-defun gptel--url-retrieve (url &key method data headers)
-  "Retrieve URL synchronously with METHOD, DATA and HEADERS."
+(cl-defun gptel--url-retrieve
+    (url &key method data headers
+         (content-type "application/json") return-response)
+  "Retrieve URL synchronously with METHOD, DATA and HEADERS.
+
+CONTENT-TYPE defaults to \"application/json\".  If RETURN-RESPONSE is
+non-nil, return a plist containing :status, :body and :raw."
   (declare (indent 1))
-  (let ((url-request-method (if (eq method 'post) "POST" "GET"))
-        (url-request-data (when (eq method 'post) (encode-coding-string (gptel--json-encode data) 'utf-8)))
-        (url-mime-accept-string "application/json")
-        (url-request-extra-headers
-         `(("content-type" . "application/json")
-           ,@headers)))
-    (with-current-buffer (url-retrieve-synchronously url 'silent)
-      (goto-char url-http-end-of-headers)
-      (gptel--json-read))))
+  (let* ((url-request-method (if (eq method 'post) "POST" "GET"))
+         (url-request-data
+          (when (eq method 'post)
+            (cond
+             ((null data) nil)
+             ((equal content-type "application/json")
+              (encode-coding-string (gptel--json-encode data) 'utf-8))
+             ((stringp data) data)
+             (t (encode-coding-string (gptel--to-string data) 'utf-8)))))
+         (url-mime-accept-string "application/json")
+         (url-request-extra-headers
+          `(("content-type" . ,content-type)
+            ,@headers))
+         (buffer (url-retrieve-synchronously url 'silent)))
+    (unless buffer
+      (error "Request failed for %s" url))
+    (with-current-buffer buffer
+      (unwind-protect
+          (let* ((status url-http-response-status)
+                 (raw (progn
+                        (goto-char (or url-http-end-of-headers (point-min)))
+                        (buffer-substring-no-properties (point) (point-max))))
+                 (body (unless (string-empty-p (string-trim raw))
+                         (if return-response
+                             (condition-case nil
+                                 (progn
+                                   (goto-char (or url-http-end-of-headers (point-min)))
+                                   (gptel--json-read))
+                               (error raw))
+                           (goto-char (or url-http-end-of-headers (point-min)))
+                           (gptel--json-read)))))
+            (if return-response
+                (list :status status :body body :raw raw)
+              body))
+        (kill-buffer buffer)))))
 
 (defsubst gptel-prompt-prefix-string ()
   "Prefix before user prompts in `gptel-mode'."
