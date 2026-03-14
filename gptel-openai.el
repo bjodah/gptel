@@ -266,25 +266,225 @@ it in :response."
                   output))
            "\n")))))
 
-(cl-defmethod gptel--request-data ((_backend gptel-openai-chatgpt) _prompts)
+(defun gptel--openai-chatgpt-wrap-content (content item-type)
+  "Wrap CONTENT as Responses API content items of ITEM-TYPE."
+  (cl-flet ((convert-part (part)
+              (pcase (plist-get part :type)
+                ("text" (list :type item-type :text (plist-get part :text)))
+                ("image_url"
+                 (list :type "input_image"
+                       :image_url (plist-get (plist-get part :image_url) :url)))
+                (_ part))))
+    (cond
+     ((stringp content)
+      (vector (list :type item-type :text content)))
+     ((or (vectorp content)
+          (and (listp content) (plist-get (car-safe content) :type)))
+      (vconcat (mapcar #'convert-part content)))
+     (t (vector (list :type item-type :text (format "%s" content)))))))
+
+(defun gptel--openai-chatgpt-tool-call-item (tool-call)
+  "Convert TOOL-CALL into a Responses API function call item."
+  (list :type "function_call"
+        :call_id (plist-get tool-call :id)
+        :name (plist-get tool-call :name)
+        :arguments (gptel--json-encode (or (plist-get tool-call :args) []))))
+
+(defun gptel--openai-chatgpt-tool-result-item (tool-call)
+  "Convert TOOL-CALL result into a Responses API function call output item."
+  (list :type "function_call_output"
+        :call_id (plist-get tool-call :id)
+        :output (plist-get tool-call :result)))
+
+(defun gptel--openai-chatgpt-response-item-p (item)
+  "Return non-nil when ITEM is already a Responses API input item."
+  (or (plist-get item :type)
+      (and (member (plist-get item :role) '("user" "assistant"))
+           (when-let* ((content (plist-get item :content))
+                       ((vectorp content))
+                       ((> (length content) 0))
+                       (part (aref content 0))
+                       (type (plist-get part :type)))
+             (member type '("input_text" "output_text" "input_image"
+                            "input_file" "refusal"))))))
+
+(defun gptel--openai-chatgpt-message-items (message)
+  "Convert MESSAGE into a list of Responses API input items."
+  (cond
+   ((gptel--openai-chatgpt-response-item-p message)
+    (list message))
+   (t
+    (let ((role (plist-get message :role))
+          (content (plist-get message :content))
+          (tool-calls (plist-get message :tool_calls)))
+      (cond
+       ((equal role "system") nil)
+       ((equal role "tool")
+        (list (list :type "function_call_output"
+                    :call_id (plist-get message :tool_call_id)
+                    :output (or content ""))))
+       (tool-calls
+        (append
+         (when (and content (not (eq content :null)))
+           (list (list :role "assistant"
+                       :content (gptel--openai-chatgpt-wrap-content
+                                 content "output_text"))))
+         (cl-loop for tool-call across tool-calls
+                  collect (list :type "function_call"
+                                :call_id (plist-get tool-call :id)
+                                :name (map-nested-elt tool-call '(:function :name))
+                                :arguments (or (map-nested-elt
+                                                tool-call '(:function :arguments))
+                                               "")))))
+       ((equal role "user")
+        (list (list :role "user"
+                    :content (gptel--openai-chatgpt-wrap-content
+                              content "input_text"))))
+       ((equal role "assistant")
+        (list (list :role "assistant"
+                    :content (gptel--openai-chatgpt-wrap-content
+                              content "output_text"))))
+       (t (list message)))))))
+
+(defun gptel--openai-chatgpt-prompts-to-input (prompts)
+  "Convert PROMPTS from chat messages to Responses API input items."
+  (vconcat
+   (apply #'append
+          (mapcar #'gptel--openai-chatgpt-message-items prompts))))
+
+(defun gptel--openai-chatgpt-convert-tools (tools)
+  "Convert chat-completions TOOLS into Responses API tool definitions."
+  (vconcat
+   (mapcar
+    (lambda (tool)
+      (pcase (plist-get tool :type)
+        ("function"
+         (let ((func (plist-get tool :function)))
+           (list :type "function"
+                 :name (plist-get func :name)
+                 :description (plist-get func :description)
+                 :parameters (plist-get func :parameters))))
+        (_ tool)))
+    tools)))
+
+(defun gptel--openai-chatgpt-insert-input-items (data items &optional position)
+  "Insert ITEMS into DATA's `:input' vector at POSITION."
+  (let* ((input (or (plist-get data :input) []))
+         (items (if (vectorp items) items (vconcat items))))
+    (pcase position
+      ('nil
+       (plist-put data :input (vconcat input items)))
+      ((pred integerp)
+       (when (< position 0) (setq position (+ (length input) position)))
+       (plist-put data :input
+                  (vconcat (substring input 0 position)
+                           items
+                           (substring input position)))))))
+
+(defun gptel--openai-chatgpt-inject-tool-use (info)
+  "Append collected tool calls from INFO to the pending request input."
+  (unless (plist-get info :chatgpt-tool-use-injected)
+    (when-let* ((tool-use (plist-get info :tool-use))
+                (backend (plist-get info :backend))
+                (data (plist-get info :data)))
+      (gptel--inject-prompt
+       backend data
+       (mapcar #'gptel--openai-chatgpt-tool-call-item tool-use))
+      (plist-put info :chatgpt-tool-use-injected t))))
+
+(defun gptel--openai-chatgpt-collect-response (response info)
+  "Collect text, metadata and tool calls from ChatGPT RESPONSE into INFO."
+  (let* ((obj (or (plist-get response :response) response))
+         (output (plist-get obj :output))
+         (chunks nil)
+         (tool-use nil))
+    (when-let* ((usage (plist-get obj :usage)))
+      (plist-put info :output-tokens (plist-get usage :output_tokens)))
+    (when-let* ((status (plist-get obj :status)))
+      (plist-put info :stop-reason status))
+    (when (vectorp output)
+      (cl-loop
+       for item across output
+       do
+       (pcase (plist-get item :type)
+         ("message"
+          (when-let* ((content (plist-get item :content)))
+            (cl-loop for part across content
+                     for type = (plist-get part :type)
+                     if (equal type "output_text")
+                     do (push (plist-get part :text) chunks)
+                     else if (equal type "refusal")
+                     do (push (format "[Refused: %s]" (plist-get part :refusal))
+                              chunks))))
+         ("function_call"
+          (push (list :id (plist-get item :call_id)
+                      :name (plist-get item :name)
+                      :args (ignore-errors
+                              (gptel--json-read-string
+                               (plist-get item :arguments))))
+                tool-use))
+         ("reasoning"
+          (when-let* ((summary (plist-get item :summary)))
+            (cl-loop for part across summary
+                     for text = (plist-get part :text)
+                     when text
+                     do (plist-put info :reasoning
+                                   (concat (plist-get info :reasoning) text)))))
+         ("code_interpreter_call"
+          (when-let* ((results (plist-get item :results)))
+            (cl-loop for result across results
+                     when (equal (plist-get result :type) "logs")
+                     do (push (format "\n```\n%s\n```" (plist-get result :logs))
+                              chunks)))))))
+    (when tool-use
+      (plist-put info :tool-use (nreverse tool-use)))
+    (when chunks
+      (apply #'concat (nreverse chunks)))))
+
+(cl-defmethod gptel--request-data ((backend gptel-openai-chatgpt) prompts)
   "Build request payload for ChatGPT Codex endpoint.
 
 This endpoint is Responses-API compatible and requires `instructions',
 `store: false' and streaming mode."
-  (let* ((system gptel--system-message)
-         (gptel--system-message nil)
-         (gptel-temperature nil)
-         (gptel-max-tokens nil)
-         (payload (cl-call-next-method)))
-    (setq payload (plist-put payload :input (plist-get payload :messages)))
-    (setq payload (gptel--openai-chatgpt-plist-remove-keys
-                   payload
-                   '(:messages :temperature :max_tokens :max_completion_tokens)))
-    (setq payload (plist-put payload :instructions
-                             (or (and (stringp system) (not (string-empty-p system)) system)
-                                 gptel-openai-chatgpt-instructions)))
-    (setq payload (plist-put payload :store :json-false))
-    (setq payload (plist-put payload :stream t))
+  (let* ((payload
+          `(:model ,(gptel--model-name gptel-model)
+            :input ,(gptel--openai-chatgpt-prompts-to-input prompts)
+            :instructions
+            ,(or (and (stringp gptel--system-message)
+                      (not (string-empty-p gptel--system-message))
+                      gptel--system-message)
+                 gptel-openai-chatgpt-instructions)
+            :store :json-false
+            :stream t))
+         (reasoning-model-p
+          (memq gptel-model '(o1 o1-preview o1-mini o3-mini o3 o4-mini
+                                 gpt-5 gpt-5-mini gpt-5-nano gpt-5.1 gpt-5.2))))
+    (when gptel-use-tools
+      (when-let* ((tools (and gptel-tools
+                              (gptel--openai-chatgpt-convert-tools
+                               (gptel--parse-tools backend gptel-tools)))))
+        (when (> (length tools) 0)
+          (plist-put payload :tools tools)))
+      (when (eq gptel-use-tools 'force)
+        (plist-put payload :tool_choice "required")))
+    (when gptel-max-tokens
+      (plist-put payload :max_output_tokens gptel-max-tokens))
+    (when gptel--schema
+      (plist-put payload :text
+                 (list :format
+                       (list :type "json_schema"
+                             :name (md5 (format "%s" (random)))
+                             :schema (gptel--preprocess-schema
+                                      (gptel--dispatch-schema-type gptel--schema))
+                             :strict t))))
+    (setq payload
+          (gptel--merge-plists
+           payload
+           gptel--request-params
+           (gptel-backend-request-params gptel-backend)
+           (gptel--model-request-params gptel-model)))
+    ;; ChatGPT's Codex Responses endpoint rejects `temperature'.
+    (setq payload (gptel--openai-chatgpt-plist-remove-keys payload '(:temperature)))
     payload))
 
 (cl-defmethod gptel-curl--parse-stream ((_backend gptel-openai-chatgpt) info)
@@ -294,7 +494,16 @@ This endpoint is Responses-API compatible and requires `instructions',
         (while (re-search-forward "^data:" nil t)
           (save-match-data
             (if (looking-at " *\\[DONE\\]")
-                nil
+                (progn
+                  (when (plist-get info :tool-use)
+                    (plist-put info :tool-use (nreverse (plist-get info :tool-use))))
+                  (when (and (not (plist-get info :tool-use))
+                             (plist-get info :chatgpt-response))
+                    (when-let* ((text (gptel--openai-chatgpt-collect-response
+                                       (plist-get info :chatgpt-response) info))
+                                ((not (or chunks (plist-get info :chatgpt-seen-delta)))))
+                      (push text chunks)))
+                  (gptel--openai-chatgpt-inject-tool-use info))
               (when-let* ((response (gptel--json-read))
                           (type (plist-get response :type)))
                 (cond
@@ -302,19 +511,69 @@ This endpoint is Responses-API compatible and requires `instructions',
                   (when-let* ((delta (plist-get response :delta)))
                     (plist-put info :chatgpt-seen-delta t)
                     (push delta chunks)))
+                 ((string= type "response.function_call_arguments.delta")
+                  (plist-put info :chatgpt-seen-tool-call t))
+                 ((string= type "response.output_item.done")
+                  (when-let* ((item (plist-get response :item))
+                              ((equal (plist-get item :type) "function_call")))
+                    (plist-put info :chatgpt-seen-tool-call t)
+                    (plist-put
+                     info :tool-use
+                     (cons (list :id (plist-get item :call_id)
+                                 :name (plist-get item :name)
+                                 :args (ignore-errors
+                                         (gptel--json-read-string
+                                          (plist-get item :arguments))))
+                           (plist-get info :tool-use)))))
+                 ((string= type "response.reasoning_summary_text.delta")
+                  (when-let* ((delta (plist-get response :delta)))
+                    (plist-put info :reasoning
+                               (concat (plist-get info :reasoning) delta))))
                  ((string= type "response.completed")
+                  (plist-put info :chatgpt-response response)
+                  (when-let* ((obj (plist-get response :response)))
+                    (when-let* ((usage (plist-get obj :usage)))
+                      (plist-put info :output-tokens (plist-get usage :output_tokens)))
+                    (when-let* ((status (plist-get obj :status)))
+                      (plist-put info :stop-reason status))
+                    ;; ChatGPT's stream ends at `response.completed'; there may
+                    ;; be no trailing `data: [DONE]` marker. Ensure tool calls
+                    ;; captured in this turn are injected before tool outputs
+                    ;; are appended on the continuation request.
+                    (when-let* ((output (plist-get obj :output))
+                                ((vectorp output))
+                                ((cl-find-if (lambda (item)
+                                               (equal (plist-get item :type)
+                                                      "function_call"))
+                                             output)))
+                      (unless (plist-get info :tool-use)
+                        (gptel--openai-chatgpt-collect-response response info))
+                      (gptel--openai-chatgpt-inject-tool-use info)))
                   (when-let* ((text (gptel--openai-chatgpt-response-text response))
                               ((not (string-empty-p text))))
-                    (unless (or chunks (plist-get info :chatgpt-seen-delta))
+                    (unless (or chunks
+                                (plist-get info :chatgpt-seen-delta)
+                                (plist-get info :chatgpt-seen-tool-call))
                       (push text chunks)))))))))
       (error (goto-char (match-beginning 0))))
     (apply #'concat (nreverse chunks))))
 
-(cl-defmethod gptel--parse-response ((_backend gptel-openai-chatgpt) response _info)
+(cl-defmethod gptel--parse-response ((_backend gptel-openai-chatgpt) response info)
   "Parse non-streaming ChatGPT Codex RESPONSE and return response text."
-  (when-let* ((text (gptel--openai-chatgpt-response-text response))
-              ((not (string-empty-p text))))
-    text))
+  (prog1
+      (gptel--openai-chatgpt-collect-response response info)
+    (gptel--openai-chatgpt-inject-tool-use info)))
+
+(cl-defmethod gptel--inject-prompt ((_backend gptel-openai-chatgpt) data new-prompt
+                                    &optional position)
+  "Inject NEW-PROMPT into DATA's `:input' array at POSITION."
+  (when (keywordp (car-safe new-prompt))
+    (setq new-prompt (list new-prompt)))
+  (gptel--openai-chatgpt-insert-input-items
+   data
+   (apply #'append
+          (mapcar #'gptel--openai-chatgpt-message-items new-prompt))
+   position))
 
 ;;;###autoload
 (defun gptel-openai-chatgpt-login (&optional backend)
@@ -634,6 +893,32 @@ Mutate state INFO with response metadata."
 ;; NOTE: No `gptel--parse-tools' method required for gptel-openai, since this is
 ;; handled by its defgeneric implementation
 
+(cl-defmethod gptel--inject-tool-call ((_backend gptel-openai-chatgpt)
+                                       data tool-call new-call)
+  "Replace TOOL-CALL in ChatGPT Codex request DATA with NEW-CALL."
+  (if-let* ((input (plist-get data :input))
+            (id (plist-get tool-call :id))
+            (index (cl-loop for item across input
+                            for i upfrom 0
+                            if (and (equal (plist-get item :type) "function_call")
+                                    (equal (plist-get item :call_id) id))
+                            return i
+                            finally return nil))
+            (call (aref input index)))
+      (if (null new-call)
+          (plist-put data :input
+                     (vconcat (substring input 0 index)
+                              (substring input (1+ index))))
+        (when-let* ((args (plist-get new-call :args)))
+          (plist-put call :arguments (gptel--json-encode args)))
+        (when-let* ((name (plist-get new-call :name)))
+          (plist-put call :name name)))
+    (display-warning
+     '(gptel tool-call)
+     (format "Could not inject updated tool-call arguments for tool call %s, %s"
+             (plist-get tool-call :name)
+             (truncate-string-to-width (prin1-to-string new-call) 50 nil nil t)))))
+
 (cl-defmethod gptel--inject-tool-call ((_backend gptel-openai) data tool-call new-call)
   "Replace TOOL-CALL in query DATA with NEW-CALL.
 
@@ -670,6 +955,10 @@ Completions API."
      (format "Could not inject updated tool-call arguments for tool call %s, %s"
              (plist-get tool-call :name)
              (truncate-string-to-width (prin1-to-string new-call) 50 nil nil t)))))
+
+(cl-defmethod gptel--parse-tool-results ((_backend gptel-openai-chatgpt) tool-use)
+  "Return Responses API tool result items for ChatGPT Codex TOOL-USE."
+  (mapcar #'gptel--openai-chatgpt-tool-result-item tool-use))
 
 (cl-defmethod gptel--parse-tool-results ((_backend gptel-openai) tool-use)
   "Return a prompt containing tool call results in TOOL-USE."
