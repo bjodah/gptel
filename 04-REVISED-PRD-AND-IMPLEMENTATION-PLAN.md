@@ -105,12 +105,14 @@ ChatGPT tokens should be stored separately from GitHub Copilot tokens.
 
 Proposed defaults:
 
-- `~/.emacs.d/.cache/chatgpt-codex/token`
+- `(expand-file-name ".cache/chatgpt-codex/token" user-emacs-directory)`
+
+Note: always use `user-emacs-directory` rather than hardcoding `~/.emacs.d/`, since users may customize this variable.
 
 Optional future split if needed:
 
-- `~/.emacs.d/.cache/chatgpt-codex/device-token`
-- `~/.emacs.d/.cache/chatgpt-codex/session-token`
+- `(expand-file-name ".cache/chatgpt-codex/device-token" user-emacs-directory)`
+- `(expand-file-name ".cache/chatgpt-codex/session-token" user-emacs-directory)`
 
 For the first patch, use one token file containing the OAuth token plist, including:
 
@@ -242,7 +244,8 @@ Current plan is to defer test additions until manual traces exist.
 Add standard file boilerplate and require:
 
 - `cl-lib`
-- `map`
+- `map` (needed for `(pcase-let ((map :key1 :key2) plist) ...)` destructuring of auth responses)
+- `url-http` (needed for `url-http-response-status` and `url-http-end-of-headers`)
 - `browse-url`
 - `gptel-request`
 - `gptel-openai-responses`
@@ -250,12 +253,12 @@ Add standard file boilerplate and require:
 Reason:
 
 - the backend must inherit from `gptel-openai-responses`
-- auth helpers need `gptel--url-retrieve`
+- auth helpers need `url-retrieve-synchronously` and custom content-type handling
 - login needs `browse-url`
 
 ### 2. Model list
 
-Add a constant:
+Add a `defcustom` (not a constant), so users can update models without patching:
 
 - `gptel--openai-chatgpt-models`
 
@@ -267,7 +270,7 @@ Initial contents:
 Each model entry should follow the same property structure used elsewhere in `gptel`:
 
 - `:description`
-- `:capabilities`
+- `:capabilities` — must include `responses-api` (this is the keyword used by `gptel-openai-responses` dispatch, not `response-api` which is used in `gptel-gh.el` for endpoint switching)
 - `:mime-types`
 - `:context-window`
 - `:input-cost`
@@ -276,7 +279,7 @@ Each model entry should follow the same property structure used elsewhere in `gp
 
 Requirements for the initial model list:
 
-- both models must include Responses API capability
+- both models must include `responses-api` capability and `tool-use`
 - both models should have zero cost because the subscription includes access
 - use conservative values for context window and capabilities unless verified by traces
 
@@ -350,13 +353,22 @@ Important implementation note:
 - do not use fragile raw regex parsing of JSON if `json-parse-string` or `gptel--json-read-string` can be used safely
 - Base64URL decoding must restore omitted `=` padding before calling `base64-decode-string`
 - after base64 decoding, decode the bytes as UTF-8 before JSON parsing
-- parse JWT payload into a plist/object and check these fields in order:
+
+`gptel--openai-chatgpt-extract-account-id` must accept a full token plist and check multiple tokens:
+
+1. First attempt extraction from `:id_token` (if present)
+2. If no account-id found, fall back to `:access_token`
+3. Return the first match, or nil
+
+For each JWT, parse the payload and check these claim fields in order:
+
   - `chatgpt_account_id`
-  - `https://api.openai.com/auth.chatgpt_account_id`
-  - first `organizations[].id`
+  - `https://api.openai.com/auth` → `chatgpt_account_id` (nested under custom namespace)
+  - first entry in `organizations` array → `id`
 
 Reason:
 
+- the reference implementation checks both `id_token` and `access_token`
 - the reference implementation supports more than one claim location
 - JSON parsing is less brittle than regex extraction
 
@@ -412,11 +424,12 @@ Recommended implementation details:
 - parse the body as JSON when possible
 - preserve raw body text for diagnostics when JSON parsing fails
 
-For form-encoded requests, do not manually concatenate query strings.
+For form-encoded requests, build the body using a helper that applies `url-hexify-string` to each key and value:
 
 Requirement:
 
-- use `url-build-query-string` for `application/x-www-form-urlencoded` POST bodies
+- implement a small local helper (e.g., `gptel--openai-chatgpt-url-encode-params`) that takes an alist of `(key . value)` pairs and returns a properly escaped `application/x-www-form-urlencoded` string using `url-hexify-string`
+- do NOT use `url-build-query-string` — it does not exist in Emacs
 
 Reason:
 
@@ -447,8 +460,10 @@ Responsibilities:
 - repeatedly POST JSON to `/api/accounts/deviceauth/token`
 - use returned `interval`
 - treat HTTP 403 and 404 as “authorization still pending”
-- sleep between polls with safety margin
-- fail on unexpected statuses
+- use `sit-for` (not `sleep-for`) between polls so Emacs remains responsive and the user can `C-g` to abort
+- add a safety margin to the polling interval (e.g., 3 seconds, matching reference implementation)
+- enforce a maximum polling duration of 5 minutes; signal `user-error` if exceeded
+- fail on unexpected statuses with a clear error including the HTTP status code and response body
 - return `authorization_code` and `code_verifier` once ready
 
 #### `gptel--openai-chatgpt-exchange-authorization-code`
@@ -483,28 +498,36 @@ Behavior:
 
 1. resolve which ChatGPT backend instance to use
 2. start device auth
-3. copy `user_code` to clipboard when possible
+3. copy `user_code` to clipboard via `(gui-set-selection 'CLIPBOARD user_code)` (may fail silently in terminal)
 4. optionally open the device URL in a browser
 5. prompt with `read-from-minibuffer`
 6. poll until authorization succeeds
 7. exchange auth code for tokens
 8. compute:
-   - `:expires_at`
-   - `:account_id`
+   - `:expires_at` from current time plus `:expires_in` (default 3600 if missing)
+   - `:account_id` via JWT extraction (check `id_token` first, then `access_token`)
 9. save token
 10. store token on backend instance
 11. display success message
 
 Backend resolution should mirror `gptel-gh-login`:
 
-- if current `gptel-backend` is a ChatGPT backend, use it
-- else search `gptel--known-backends`
+- if current `gptel-backend` is a ChatGPT backend (use `gptel-openai-chatgpt-p` predicate), use it
+- else search `gptel--known-backends` via `(cl-find-if #'gptel-openai-chatgpt-p (mapcar #'cdr gptel--known-backends))`
 - else raise a user error telling the user to call `gptel-make-openai-chatgpt` first
+
+Note: `gptel-openai-chatgpt-p` is auto-generated by `cl-defstruct` — no need to define it manually.
 
 SSH handling:
 
-- follow the same general behavior as `gptel-gh-login`
-- do not rely on browser auto-open in SSH
+- detect SSH sessions by checking environment variables: `SSH_CLIENT`, `SSH_CONNECTION`, `SSH_TTY`
+- in SSH sessions: display the device URL and user code in the minibuffer but do NOT call `browse-url`
+- in local sessions: optionally open `https://auth.openai.com/codex/device` via `browse-url`
+
+Error handling in auth flow:
+
+- if any auth HTTP request returns an unexpected status (not 200, and not 403/404 during polling), signal a `user-error` including the HTTP status and raw response body for diagnostics
+- wrap JSON parsing in `condition-case` and signal clear errors on malformed responses
 
 ### 10. Refresh helper
 
@@ -521,8 +544,9 @@ Behavior:
   - `refresh_token`
   - `client_id`
 - preserve old refresh token if the response omits a new one
-- recompute `:expires_at`
-- recompute or preserve `:account_id`
+- if `expires_in` is missing from the response, default to 3600 seconds
+- recompute `:expires_at` from current time plus `expires_in`
+- if the new token yields no `account_id` via JWT extraction, keep the previous `:account_id` value
 - save token to disk
 - update backend slot
 
@@ -595,9 +619,12 @@ Implement the autoloaded public constructor:
 
 - `gptel-make-openai-chatgpt`
 
+The function must be preceded by a `;;;###autoload` cookie so it can be called from init files without an explicit `require`.
+
 Suggested signature:
 
 ```elisp
+;;;###autoload
 (cl-defun gptel-make-openai-chatgpt
     (name &key curl-args request-params
           (models gptel--openai-chatgpt-models)
@@ -611,6 +638,8 @@ Suggested signature:
 Implementation requirements:
 
 - construct a `gptel-openai-chatgpt` backend via `gptel--make-openai-chatgpt`
+- process models through `gptel--process-models` before passing to the struct constructor (all existing constructors do this)
+- compute the `:url` slot as `(concat protocol "://" host endpoint)` — this can be a string since the endpoint is static
 - pass:
   - name
   - host
@@ -622,7 +651,7 @@ Implementation requirements:
   - request params
   - curl args
   - url
-- register in `gptel--known-backends`
+- register in `gptel--known-backends` via `(setf (alist-get name gptel--known-backends nil nil #'equal) backend)`
 - return backend instance
 
 Reason:
@@ -759,12 +788,31 @@ Mitigation:
 - accept this for the first patch
 - keep logic simple and localized
 
+### Risk: device-auth polling blocks Emacs during login
+
+The polling loop runs synchronously and can last several minutes.
+
+Mitigation:
+
+- use `sit-for` instead of `sleep-for` so Emacs remains responsive and can redisplay
+- the user can abort with `C-g` at any time
+- enforce a 5-minute maximum polling timeout
+
 ### Risk: full device login from request path would freeze Emacs
 
 Mitigation:
 
 - do not implement implicit login in `gptel--openai-chatgpt-ensure-token`
 - require explicit login when no token exists
+
+### Risk: `originator` header value may not be accepted
+
+The reference implementation sends `"opencode"`. This implementation sends `"gptel"`. If the Codex endpoint validates or rate-limits by originator, requests could be rejected.
+
+Mitigation:
+
+- make the originator value easy to change (defined in one place)
+- monitor for 403 or unexpected rejections during manual testing
 
 ### Risk: model metadata may not be exact
 
