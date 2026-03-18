@@ -417,6 +417,7 @@ constructor functions:
 - `gptel-make-xai'
 - `gptel-make-gh-copilot'
 - `gptel-make-bedrock'
+- `gptel-make-openai-chatgpt'
 
 In addition, `gptel-backend' can be assigned to them.  Examples:
 
