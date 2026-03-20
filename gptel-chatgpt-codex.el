@@ -307,7 +307,7 @@ Updates the backend token slot and saves to disk."
   "Ensure BACKEND has a valid token, refreshing if needed.
 Returns the token plist.  Signals `user-error' if no token exists."
   (let ((token (or (gptel-openai-chatgpt-token backend)
-                   (let ((restored (gptel-oauth-restore-state
+                   (let ((restored (gptel-auth-restore-state
                                     gptel-openai-chatgpt-token-file)))
                      (when restored
                        (setf (gptel-openai-chatgpt-token backend) restored))
@@ -382,7 +382,7 @@ https://auth.openai.com/codex/device"
                       :expires_at (+ (float-time) expires-in)
                       :account_id (gptel--openai-chatgpt-extract-account-id tokens))))
           ;; Step 8-10: Save and store
-          (gptel-oauth-save-state gptel-openai-chatgpt-token-file full-token)
+          (gptel-auth-save-state gptel-openai-chatgpt-token-file full-token)
           (setf (gptel-openai-chatgpt-token backend) full-token)
           ;; Step 11: Success
           (message "Successfully logged in to ChatGPT Codex."))))))
