@@ -25,7 +25,6 @@
   (require 'gptel-request)
   (require 'gptel-openai)
   (require 'gptel-openai-responses))
-(require 'browse-url)
 (require 'gptel-oauth)
 
 ;;; Github Copilot
@@ -266,26 +265,25 @@ instead of attempting to open a browser automatically."
           (t (user-error "No GitHub Copilot backend found.  \
 Please set one up with `gptel-make-gh-copilot' first")))))
     (pcase-let (((map :device_code :user_code :verification_uri)
-                 (gptel--url-retrieve
-                     "https://github.com/login/device/code"
-                   :method 'post
-                   :headers gptel--gh-auth-common-headers
-                   :data `( :client_id ,gptel--gh-client-id
-                            :scope "read:user"))))
+                 (plist-get
+                  (gptel-oauth-request "https://github.com/login/device/code"
+                                       :headers gptel--gh-auth-common-headers
+                                       :data `( :client_id ,gptel--gh-client-id
+                                                :scope "read:user"))
+                  :body)))
       (gptel-oauth-device-auth-prompt user_code verification_uri)
       ;; Use gh-backend for token storage
-      (thread-last
-        (plist-get
-         (gptel--url-retrieve
-             "https://github.com/login/oauth/access_token"
-           :method 'post
-           :headers gptel--gh-auth-common-headers
-           :data `( :client_id ,gptel--gh-client-id
-                    :device_code ,device_code
-                    :grant_type "urn:ietf:params:oauth:grant-type:device_code"))
-         :access_token)
-        (gptel-oauth-save-token gptel-gh-github-token-file)
-        (setf (gptel--gh-github-token gh-backend))))
+      (let ((resp-body (plist-get
+                        (gptel-oauth-request "https://github.com/login/oauth/access_token"
+                                             :headers gptel--gh-auth-common-headers
+                                             :data `( :client_id ,gptel--gh-client-id
+                                                      :device_code ,device_code
+                                                      :grant_type "urn:ietf:params:oauth:grant-type:device_code"))
+                        :body)))
+        (thread-last
+            (plist-get resp-body :access_token)
+          (gptel-oauth-save-token gptel-gh-github-token-file)
+          (setf (gptel--gh-github-token gh-backend)))))
     ;; Check gh-backend for success
     (if (and (gptel--gh-github-token gh-backend)
              (not (string-empty-p
@@ -296,18 +294,19 @@ Please set one up with `gptel-make-gh-copilot' first")))))
 (defun gptel--gh-renew-token ()
   "Renew session token."
   (let ((token
-         (gptel--url-retrieve
-             "https://api.github.com/copilot_internal/v2/token"
-           :method 'get
-           :headers `(("authorization"
-                       . ,(format "token %s" (gptel--gh-github-token gptel-backend)))
-                      ,@gptel--gh-auth-common-headers))))
+         (plist-get
+          (gptel-oauth-request "https://api.github.com/copilot_internal/v2/token"
+                               :method 'get
+                               :headers `(("authorization"
+                                           . ,(format "token %s" (gptel--gh-github-token gptel-backend)))
+                                          ,@gptel--gh-auth-common-headers))
+          :body)))
     (if (not (plist-get token :token))
         (progn
           (setf (gptel--gh-github-token gptel-backend) nil)
           (user-error "Error: You might not have access to GitHub Copilot Chat!"))
-      (thread-last
-        (gptel-oauth-save-token gptel-gh-token-file token)
+      (thread-last token
+        (gptel-oauth-save-token gptel-gh-token-file)
         (setf (gptel--gh-token gptel-backend))))))
 
 (defun gptel--gh-auth ()

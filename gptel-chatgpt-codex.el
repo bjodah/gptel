@@ -32,8 +32,6 @@
 
 (require 'cl-lib)
 (require 'map)
-(require 'url-http)
-(require 'browse-url)
 (require 'gptel-request)
 (require 'gptel-openai-responses)
 (require 'gptel-oauth)
@@ -42,10 +40,6 @@
 (defvar gptel-backend)
 (defvar gptel--known-backends)
 (declare-function gptel--process-models "gptel-request")
-(declare-function gptel--json-encode "gptel-request")
-(declare-function gptel--json-read "gptel-request")
-(declare-function gptel--json-read-string "gptel-request")
-
 
 ;;; ---- Constants and customizations ----
 
@@ -127,63 +121,6 @@ Checks :id_token first, then :access_token."
         (gptel--openai-chatgpt-extract-account-id-from-claims
          (gptel-oauth-jwt-payload access-token)))))
 
-
-;;; ---- URL encoding helper ----
-
-(defun gptel--openai-chatgpt-url-encode-params (params)
-  "Encode PARAMS alist as application/x-www-form-urlencoded string.
-PARAMS is an alist of (KEY . VALUE) string pairs."
-  (mapconcat (lambda (pair)
-               (concat (url-hexify-string (car pair))
-                       "="
-                       (url-hexify-string (cdr pair))))
-             params "&"))
-
-
-;;; ---- Low-level HTTP helper ----
-
-(defun gptel--openai-chatgpt-request (url &optional data content-type extra-headers)
-  "POST to URL with DATA and return (:status N :body PLIST :raw STRING).
-
-CONTENT-TYPE defaults to \"application/json\".  When CONTENT-TYPE is
-\"application/x-www-form-urlencoded\", DATA should be an already-encoded string.
-When CONTENT-TYPE is \"application/json\", DATA should be a plist.
-EXTRA-HEADERS is an alist of additional headers."
-  (let* ((content-type (or content-type "application/json"))
-         (url-request-method "POST")
-         (url-request-data
-          (encode-coding-string
-           (cond
-            ((string-prefix-p "application/json" content-type)
-             (gptel--json-encode data))
-            (t data))
-           'utf-8))
-         (url-request-extra-headers
-          `(("Content-Type" . ,content-type)
-            ("Accept" . "application/json")
-            ,@extra-headers))
-         (url-mime-accept-string "application/json")
-         (buf (url-retrieve-synchronously url 'silent)))
-    (unwind-protect
-        (if (not (buffer-live-p buf))
-            (list :status nil :body nil :raw "")
-          (with-current-buffer buf
-            (let ((status (bound-and-true-p url-http-response-status))
-                  (raw-body "")
-                  (parsed nil))
-              (when (bound-and-true-p url-http-end-of-headers)
-                (goto-char url-http-end-of-headers)
-                (setq raw-body (buffer-substring-no-properties (point) (point-max)))
-                (condition-case nil
-                    (progn
-                      (goto-char url-http-end-of-headers)
-                      (setq parsed (gptel--json-read)))
-                  (error nil)))
-              (list :status status :body parsed :raw raw-body))))
-      (when (buffer-live-p buf)
-        (kill-buffer buf)))))
-
-
 ;;; ---- Device flow helpers ----
 
 (defun gptel--openai-chatgpt-start-device-auth ()
@@ -191,9 +128,7 @@ EXTRA-HEADERS is an alist of additional headers."
 Returns a plist with :device_auth_id, :user_code, and :interval."
   (let* ((url (concat gptel--openai-chatgpt-issuer
                       "/api/accounts/deviceauth/usercode"))
-         (result (gptel--openai-chatgpt-request
-                  url
-                  `(:client_id ,gptel--openai-chatgpt-client-id))))
+         (result (gptel-oauth-request url :data `(:client_id ,gptel--openai-chatgpt-client-id))))
     (unless (eq (plist-get result :status) 200)
       (user-error "Failed to initiate device authorization (HTTP %s): %s"
                   (plist-get result :status)
@@ -220,10 +155,8 @@ Returns a plist with :authorization_code and :code_verifier on success."
       (when (> (float-time) deadline)
         (user-error "Device authorization timed out after %d seconds"
                     gptel--openai-chatgpt-polling-timeout))
-      (let* ((result (gptel--openai-chatgpt-request
-                      url
-                      `(:device_auth_id ,device-auth-id
-                        :user_code ,user-code)))
+      (let* ((result (gptel-oauth-request url :data `(:device_auth_id ,device-auth-id
+                                                      :user_code ,user-code)))
              (status (plist-get result :status)))
         (cond
          ((eq status 200)
@@ -242,14 +175,13 @@ Returns a plist with :authorization_code and :code_verifier on success."
   "Exchange authorization CODE and CODE-VERIFIER for OAuth tokens.
 Returns the token response plist."
   (let* ((url (concat gptel--openai-chatgpt-issuer "/oauth/token"))
-         (body (gptel--openai-chatgpt-url-encode-params
+         (body (gptel-oauth-url-encode-params
                 `(("grant_type" . "authorization_code")
                   ("code" . ,code)
                   ("redirect_uri" . "https://auth.openai.com/deviceauth/callback")
                   ("client_id" . ,gptel--openai-chatgpt-client-id)
                   ("code_verifier" . ,code-verifier))))
-         (result (gptel--openai-chatgpt-request
-                  url body "application/x-www-form-urlencoded")))
+         (result (gptel-oauth-request url :data body :content-type "application/x-www-form-urlencoded")))
     (unless (eq (plist-get result :status) 200)
       (user-error "Token exchange failed (HTTP %s): %s"
                   (plist-get result :status)
@@ -267,12 +199,11 @@ Updates the backend token slot and saves to disk."
     (unless refresh-tok
       (user-error "No refresh token available.  Please run M-x gptel-openai-chatgpt-login"))
     (let* ((url (concat gptel--openai-chatgpt-issuer "/oauth/token"))
-           (body (gptel--openai-chatgpt-url-encode-params
+           (body (gptel-oauth-url-encode-params
                   `(("grant_type" . "refresh_token")
                     ("refresh_token" . ,refresh-tok)
                     ("client_id" . ,gptel--openai-chatgpt-client-id))))
-           (result (gptel--openai-chatgpt-request
-                    url body "application/x-www-form-urlencoded")))
+           (result (gptel-oauth-request url :data body :content-type "application/x-www-form-urlencoded")))
       (unless (eq (plist-get result :status) 200)
         (user-error "Token refresh failed (HTTP %s): %s"
                     (plist-get result :status)
