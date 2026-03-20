@@ -24,8 +24,9 @@
 (eval-and-compile
   (require 'gptel-request)
   (require 'gptel-openai)
-  (require 'gptel-openai-responses))
-(require 'browse-url)
+  (require 'gptel-openai-responses)
+  (require 'gptel-oauth))
+
 
 ;;; Github Copilot
 (defconst gptel--gh-models
@@ -242,27 +243,6 @@
       (setq hex (nconc hex (list (aref hex-chars (random 16))))))
     (apply #'string hex)))
 
-(defun gptel--gh-restore (file)
-  "Restore saved object from FILE."
-  (when (file-exists-p file)
-    ;; We set the coding system to `utf-8-auto-dos' when reading so that
-    ;; files with CR EOL can still be read properly
-    (let ((coding-system-for-read 'utf-8-auto-dos))
-      (with-temp-buffer
-        (set-buffer-multibyte nil)
-        (insert-file-contents-literally file)
-        (goto-char (point-min))
-        (read (current-buffer))))))
-
-(defun gptel--gh-save (file obj)
-  "Save OBJ to FILE."
-  (let ((print-length nil)
-        (print-level nil)
-        (coding-system-for-write 'utf-8-unix))
-    (make-directory (file-name-directory file) t)
-    (write-region (prin1-to-string obj) nil file nil :silent)
-    obj))
-
 (defun gptel-gh-login ()
   "Login to GitHub Copilot API.
 
@@ -271,39 +251,29 @@ This will prompt you to authorize in a browser and store the token.
 In SSH sessions, the URL and code will be displayed for manual entry
 instead of attempting to open a browser automatically."
   (interactive)
-  ;; Determine which GitHub backend to use
   (let ((gh-backend
-         (cond
-          ;; If current backend is GitHub, use it
-          ((and (boundp 'gptel-backend)
-                gptel-backend
-                (gptel--gh-p gptel-backend))
-           gptel-backend)
-          ;; Otherwise, find any GitHub backend
-          ((cl-find-if (lambda (b) (gptel--gh-p b))
-                       (mapcar #'cdr gptel--known-backends)))
-          ;; No GitHub backend found
-          (t (user-error "No GitHub Copilot backend found.  \
-Please set one up with `gptel-make-gh-copilot' first"))))
-        ;; Detect SSH sessions
-        (in-ssh-session (or (getenv "SSH_CLIENT")
-                            (getenv "SSH_CONNECTION")
-                            (getenv "SSH_TTY"))))
+         (gptel-oauth-resolve-backend
+          #'gptel--gh-p
+          "No GitHub Copilot backend found.  Please set one up with `gptel-make-gh-copilot' first")))
     (pcase-let (((map :device_code :user_code :verification_uri)
                  (gptel--url-retrieve
-                     "https://github.com/login/device/code"
-                   :method 'post
-                   :headers gptel--gh-auth-common-headers
-                   :data `( :client_id ,gptel--gh-client-id
-                            :scope "read:user"))))
-      (gui-set-selection 'CLIPBOARD user_code)
-      (if in-ssh-session
-          ;; SSH session: display URL and code, don't auto-open browser
-          (progn
-            (message "GitHub Device Code: %s (copied to clipboard)" user_code)
-            (read-from-minibuffer
-             (format "Code %s is copied. Visit https://github.com/login/device \
-in your local browser, enter the code, and authorize.  Press ENTER after authorizing. "
+                  "https://github.com/login/device/code"
+                  :method 'post
+                  :headers gptel--gh-auth-common-headers
+                  :data `( :client_id ,gptel--gh-client-id
+                           :scope "read:user"))))
+      (gptel-oauth-authorize-device
+       user_code verification_uri
+       :ssh-message
+       (format "Code %s is copied. Visit https://github.com/login/device \
+in your local browser, enter the code, and authorize. Press ENTER after authorizing. "
+               user_code)
+       :browser-message
+       (format "Your one-time code %s is copied. Press ENTER to open GitHub \
+in your browser. If your browser does not open automatically, browse to %s."
+               user_code verification_uri)
+       :authorized-message
+       "Press ENTER after authorizing. ")
                      user_code)))
         ;; Local session: auto-open browser
         (read-from-minibuffer
@@ -324,7 +294,7 @@ If your browser does not open automatically, browse to %s."
                     :device_code ,device_code
                     :grant_type "urn:ietf:params:oauth:grant-type:device_code"))
          :access_token)
-        (gptel--gh-save gptel-gh-github-token-file)
+        (gptel-oauth-save-state gptel-gh-github-token-file)
         (setf (gptel--gh-github-token gh-backend))))
     ;; Check gh-backend for success
     (if (and (gptel--gh-github-token gh-backend)
@@ -347,7 +317,7 @@ If your browser does not open automatically, browse to %s."
           (setf (gptel--gh-github-token gptel-backend) nil)
           (user-error "Error: You might not have access to GitHub Copilot Chat!"))
       (thread-last
-        (gptel--gh-save gptel-gh-token-file token)
+        (gptel-oauth-save-state gptel-gh-token-file token)
         (setf (gptel--gh-token gptel-backend))))))
 
 (defun gptel--gh-auth ()
@@ -356,7 +326,7 @@ If your browser does not open automatically, browse to %s."
 We first need github authorization (github token).
 Then we need a session token."
   (unless (gptel--gh-github-token gptel-backend)
-    (let ((token (gptel--gh-restore gptel-gh-github-token-file)))
+    (let ((token (gptel-oauth-restore-state gptel-gh-github-token-file)))
       (if token
           (setf (gptel--gh-github-token gptel-backend) token)
         (gptel-gh-login))))
@@ -364,14 +334,12 @@ Then we need a session token."
   (when (null (gptel--gh-token gptel-backend))
     ;; try to load token from `gptel-gh-token-file'
     (setf (gptel--gh-token gptel-backend)
-          (gptel--gh-restore gptel-gh-token-file)))
+          (gptel-oauth-restore-state gptel-gh-token-file)))
 
   (pcase-let (((map :token :expires_at)
                (gptel--gh-token gptel-backend)))
     (when (or (null token)
-              (and expires_at
-                   (> (round (float-time (current-time)))
-                      expires_at)))
+              (gptel-oauth-expires-soon-p expires_at))
       (gptel--gh-renew-token))))
 
 (cl-defmethod gptel-curl--parse-stream ((backend gptel--gh) info)
