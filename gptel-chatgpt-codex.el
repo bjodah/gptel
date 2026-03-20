@@ -32,19 +32,14 @@
 
 (require 'cl-lib)
 (require 'map)
-(require 'url-http)
-(require 'browse-url)
 (require 'gptel-request)
 (require 'gptel-openai-responses)
+(require 'gptel-oauth)
 
 ;; Forward declarations
 (defvar gptel-backend)
 (defvar gptel--known-backends)
 (declare-function gptel--process-models "gptel-request")
-(declare-function gptel--json-encode "gptel-request")
-(declare-function gptel--json-read "gptel-request")
-(declare-function gptel--json-read-string "gptel-request")
-
 
 ;;; ---- Constants and customizations ----
 
@@ -103,53 +98,7 @@ Each entry is (SYMBOL . PLIST) where PLIST contains model metadata."
   "A ChatGPT Codex backend for gptel."
   token)
 
-
-;;; ---- Persistence helpers ----
-
-(defun gptel--openai-chatgpt-save-token (token)
-  "Save TOKEN plist to `gptel-openai-chatgpt-token-file'."
-  (let ((print-length nil)
-        (print-level nil)
-        (coding-system-for-write 'utf-8-unix))
-    (make-directory (file-name-directory gptel-openai-chatgpt-token-file) t)
-    (write-region (prin1-to-string token) nil
-                  gptel-openai-chatgpt-token-file nil :silent)
-    token))
-
-(defun gptel--openai-chatgpt-restore-token ()
-  "Restore token plist from `gptel-openai-chatgpt-token-file'."
-  (when (file-exists-p gptel-openai-chatgpt-token-file)
-    (let ((coding-system-for-read 'utf-8-auto-dos))
-      (with-temp-buffer
-        (set-buffer-multibyte nil)
-        (insert-file-contents-literally gptel-openai-chatgpt-token-file)
-        (goto-char (point-min))
-        (condition-case nil
-            (read (current-buffer))
-          (error nil))))))
-
-
 ;;; ---- JWT / account-id helpers ----
-
-(defun gptel--openai-chatgpt-base64url-decode (str)
-  "Decode Base64URL string STR, adding padding if necessary."
-  (let* ((str (replace-regexp-in-string "-" "+" str))
-         (str (replace-regexp-in-string "_" "/" str))
-         (pad (% (length str) 4)))
-    (when (> pad 0)
-      (setq str (concat str (make-string (- 4 pad) ?=))))
-    (decode-coding-string (base64-decode-string str) 'utf-8 t)))
-
-(defun gptel--openai-chatgpt-jwt-payload (jwt-string)
-  "Parse the payload of JWT-STRING and return it as a plist.
-Returns nil if parsing fails."
-  (condition-case nil
-      (let* ((parts (split-string jwt-string "\\."))
-             (payload (nth 1 parts)))
-        (when payload
-          (gptel--json-read-string
-           (gptel--openai-chatgpt-base64url-decode payload))))
-    (error nil)))
 
 (defun gptel--openai-chatgpt-extract-account-id-from-claims (claims)
   "Extract account ID from JWT CLAIMS plist.
@@ -167,67 +116,10 @@ Checks multiple claim locations in order."
 Checks :id_token first, then :access_token."
   (or (when-let* ((id-token (plist-get token-plist :id_token)))
         (gptel--openai-chatgpt-extract-account-id-from-claims
-         (gptel--openai-chatgpt-jwt-payload id-token)))
+         (gptel-oauth-jwt-payload id-token)))
       (when-let* ((access-token (plist-get token-plist :access_token)))
         (gptel--openai-chatgpt-extract-account-id-from-claims
-         (gptel--openai-chatgpt-jwt-payload access-token)))))
-
-
-;;; ---- URL encoding helper ----
-
-(defun gptel--openai-chatgpt-url-encode-params (params)
-  "Encode PARAMS alist as application/x-www-form-urlencoded string.
-PARAMS is an alist of (KEY . VALUE) string pairs."
-  (mapconcat (lambda (pair)
-               (concat (url-hexify-string (car pair))
-                       "="
-                       (url-hexify-string (cdr pair))))
-             params "&"))
-
-
-;;; ---- Low-level HTTP helper ----
-
-(defun gptel--openai-chatgpt-request (url &optional data content-type extra-headers)
-  "POST to URL with DATA and return (:status N :body PLIST :raw STRING).
-
-CONTENT-TYPE defaults to \"application/json\".  When CONTENT-TYPE is
-\"application/x-www-form-urlencoded\", DATA should be an already-encoded string.
-When CONTENT-TYPE is \"application/json\", DATA should be a plist.
-EXTRA-HEADERS is an alist of additional headers."
-  (let* ((content-type (or content-type "application/json"))
-         (url-request-method "POST")
-         (url-request-data
-          (encode-coding-string
-           (cond
-            ((string-prefix-p "application/json" content-type)
-             (gptel--json-encode data))
-            (t data))
-           'utf-8))
-         (url-request-extra-headers
-          `(("Content-Type" . ,content-type)
-            ("Accept" . "application/json")
-            ,@extra-headers))
-         (url-mime-accept-string "application/json")
-         (buf (url-retrieve-synchronously url 'silent)))
-    (unwind-protect
-        (if (not (buffer-live-p buf))
-            (list :status nil :body nil :raw "")
-          (with-current-buffer buf
-            (let ((status (bound-and-true-p url-http-response-status))
-                  (raw-body "")
-                  (parsed nil))
-              (when (bound-and-true-p url-http-end-of-headers)
-                (goto-char url-http-end-of-headers)
-                (setq raw-body (buffer-substring-no-properties (point) (point-max)))
-                (condition-case nil
-                    (progn
-                      (goto-char url-http-end-of-headers)
-                      (setq parsed (gptel--json-read)))
-                  (error nil)))
-              (list :status status :body parsed :raw raw-body))))
-      (when (buffer-live-p buf)
-        (kill-buffer buf)))))
-
+         (gptel-oauth-jwt-payload access-token)))))
 
 ;;; ---- Device flow helpers ----
 
@@ -236,9 +128,7 @@ EXTRA-HEADERS is an alist of additional headers."
 Returns a plist with :device_auth_id, :user_code, and :interval."
   (let* ((url (concat gptel--openai-chatgpt-issuer
                       "/api/accounts/deviceauth/usercode"))
-         (result (gptel--openai-chatgpt-request
-                  url
-                  `(:client_id ,gptel--openai-chatgpt-client-id))))
+         (result (gptel-oauth-request url :data `(:client_id ,gptel--openai-chatgpt-client-id))))
     (unless (eq (plist-get result :status) 200)
       (user-error "Failed to initiate device authorization (HTTP %s): %s"
                   (plist-get result :status)
@@ -265,10 +155,8 @@ Returns a plist with :authorization_code and :code_verifier on success."
       (when (> (float-time) deadline)
         (user-error "Device authorization timed out after %d seconds"
                     gptel--openai-chatgpt-polling-timeout))
-      (let* ((result (gptel--openai-chatgpt-request
-                      url
-                      `(:device_auth_id ,device-auth-id
-                        :user_code ,user-code)))
+      (let* ((result (gptel-oauth-request url :data `(:device_auth_id ,device-auth-id
+                                                      :user_code ,user-code)))
              (status (plist-get result :status)))
         (cond
          ((eq status 200)
@@ -287,14 +175,13 @@ Returns a plist with :authorization_code and :code_verifier on success."
   "Exchange authorization CODE and CODE-VERIFIER for OAuth tokens.
 Returns the token response plist."
   (let* ((url (concat gptel--openai-chatgpt-issuer "/oauth/token"))
-         (body (gptel--openai-chatgpt-url-encode-params
+         (body (gptel-oauth-url-encode-params
                 `(("grant_type" . "authorization_code")
                   ("code" . ,code)
                   ("redirect_uri" . "https://auth.openai.com/deviceauth/callback")
                   ("client_id" . ,gptel--openai-chatgpt-client-id)
                   ("code_verifier" . ,code-verifier))))
-         (result (gptel--openai-chatgpt-request
-                  url body "application/x-www-form-urlencoded")))
+         (result (gptel-oauth-request url :data body :content-type "application/x-www-form-urlencoded")))
     (unless (eq (plist-get result :status) 200)
       (user-error "Token exchange failed (HTTP %s): %s"
                   (plist-get result :status)
@@ -312,12 +199,11 @@ Updates the backend token slot and saves to disk."
     (unless refresh-tok
       (user-error "No refresh token available.  Please run M-x gptel-openai-chatgpt-login"))
     (let* ((url (concat gptel--openai-chatgpt-issuer "/oauth/token"))
-           (body (gptel--openai-chatgpt-url-encode-params
+           (body (gptel-oauth-url-encode-params
                   `(("grant_type" . "refresh_token")
                     ("refresh_token" . ,refresh-tok)
                     ("client_id" . ,gptel--openai-chatgpt-client-id))))
-           (result (gptel--openai-chatgpt-request
-                    url body "application/x-www-form-urlencoded")))
+           (result (gptel-oauth-request url :data body :content-type "application/x-www-form-urlencoded")))
       (unless (eq (plist-get result :status) 200)
         (user-error "Token refresh failed (HTTP %s): %s"
                     (plist-get result :status)
@@ -333,7 +219,7 @@ Updates the backend token slot and saves to disk."
                     :expires_at (+ (float-time) expires-in)
                     :account_id (or (gptel--openai-chatgpt-extract-account-id new-tokens)
                                     (plist-get old-token :account_id)))))
-        (gptel--openai-chatgpt-save-token merged)
+        (gptel-oauth-save-token gptel-openai-chatgpt-token-file merged)
         (setf (gptel-openai-chatgpt-token backend) merged)
         merged))))
 
@@ -344,7 +230,7 @@ Updates the backend token slot and saves to disk."
   "Ensure BACKEND has a valid token, refreshing if needed.
 Returns the token plist.  Signals `user-error' if no token exists."
   (let ((token (or (gptel-openai-chatgpt-token backend)
-                   (let ((restored (gptel--openai-chatgpt-restore-token)))
+                   (let ((restored (gptel-oauth-restore-token gptel-openai-chatgpt-token-file)))
                      (when restored
                        (setf (gptel-openai-chatgpt-token backend) restored))
                      restored))))
@@ -394,30 +280,12 @@ This will prompt you to authorize in a browser and store the token.
 In SSH sessions, the URL and code will be displayed for manual entry
 instead of attempting to open a browser automatically."
   (interactive)
-  (let* ((backend (gptel--openai-chatgpt-resolve-backend))
-         (in-ssh (or (getenv "SSH_CLIENT")
-                     (getenv "SSH_CONNECTION")
-                     (getenv "SSH_TTY"))))
+  (let* ((backend (gptel--openai-chatgpt-resolve-backend)))
     ;; Step 1: Start device auth
     (pcase-let (((map :device_auth_id :user_code :interval)
                  (gptel--openai-chatgpt-start-device-auth)))
-      ;; Step 2: Copy code to clipboard
-      (ignore-errors (gui-set-selection 'CLIPBOARD user_code))
-      ;; Step 3-5: Prompt user
-      (if in-ssh
-          (progn
-            (message "ChatGPT Device Code: %s (copied to clipboard)" user_code)
-            (read-from-minibuffer
-             (format "Code %s is copied.  Visit https://auth.openai.com/codex/device \
-in your local browser, enter the code, and authorize.  Press ENTER after authorizing. "
-                     user_code)))
-        (read-from-minibuffer
-         (format "Your one-time code %s is copied.  \
-Press ENTER to open the authorization page.  \
-If your browser does not open, visit https://auth.openai.com/codex/device"
-                 user_code))
-        (browse-url "https://auth.openai.com/codex/device")
-        (read-from-minibuffer "Press ENTER after authorizing in your browser. "))
+      ;; Step 2-5: Prompt user
+      (gptel-oauth-device-auth-prompt user_code "https://auth.openai.com/codex/device")
       ;; Step 6: Poll
       (message "Waiting for authorization...")
       (pcase-let (((map :authorization_code :code_verifier)
@@ -436,7 +304,7 @@ If your browser does not open, visit https://auth.openai.com/codex/device"
                       :expires_at (+ (float-time) expires-in)
                       :account_id (gptel--openai-chatgpt-extract-account-id tokens))))
           ;; Step 8-10: Save and store
-          (gptel--openai-chatgpt-save-token full-token)
+          (gptel-oauth-save-token gptel-openai-chatgpt-token-file full-token)
           (setf (gptel-openai-chatgpt-token backend) full-token)
           ;; Step 11: Success
           (message "Successfully logged in to ChatGPT Codex."))))))
