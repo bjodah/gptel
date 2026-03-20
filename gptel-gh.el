@@ -1,4 +1,4 @@
-;;; gptel-gh.el ---  Github Copilot AI support for gptel  -*- lexical-binding: t; -*-
+;;; gptel-gh.el --- Github Copilot AI support for gptel  -*- lexical-binding: t; -*-
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -17,8 +17,9 @@
 
 ;; This file adds support for Github Copilot API to gptel.
 ;;
-;; Authentication helpers (token persistence, device-flow UX) live in
-;; gptel-oauth.el.
+;; Shared auth primitives live in:
+;;   gptel-auth-common.el  -- persistence, expiry, backend resolution
+;;   gptel-oauth.el        -- device-flow UX
 
 ;;; Code:
 
@@ -28,6 +29,7 @@
   (require 'gptel-request)
   (require 'gptel-openai)
   (require 'gptel-openai-responses))
+(require 'gptel-auth-common)
 (require 'gptel-oauth)
 
 ;;; Github Copilot
@@ -245,17 +247,6 @@
       (setq hex (nconc hex (list (aref hex-chars (random 16))))))
     (apply #'string hex)))
 
-;; Thin wrappers that supply the appropriate file path to the generic helpers
-;; in gptel-oauth.el.
-
-(defun gptel--gh-restore (file)
-  "Restore saved object from FILE."
-  (gptel-oauth--restore file))
-
-(defun gptel--gh-save (file obj)
-  "Save OBJ to FILE."
-  (gptel-oauth--save file obj))
-
 (defun gptel-gh-login ()
   "Login to GitHub Copilot API.
 
@@ -264,20 +255,11 @@ This will prompt you to authorize in a browser and store the token.
 In SSH sessions, the URL and code will be displayed for manual entry
 instead of attempting to open a browser automatically."
   (interactive)
-  ;; Determine which GitHub backend to use
   (let ((gh-backend
-         (cond
-          ;; If current backend is GitHub, use it
-          ((and (boundp 'gptel-backend)
-                gptel-backend
-                (gptel--gh-p gptel-backend))
-           gptel-backend)
-          ;; Otherwise, find any GitHub backend
-          ((cl-find-if (lambda (b) (gptel--gh-p b))
-                       (mapcar #'cdr gptel--known-backends)))
-          ;; No GitHub backend found
-          (t (user-error "No GitHub Copilot backend found.  \
-Please set one up with `gptel-make-gh-copilot' first")))))
+         (gptel-auth-resolve-backend
+          #'gptel--gh-p
+          "No GitHub Copilot backend found.  \
+Please set one up with `gptel-make-gh-copilot' first")))
     (pcase-let (((map :device_code :user_code :verification_uri)
                  (gptel--url-retrieve
                      "https://github.com/login/device/code"
@@ -285,9 +267,7 @@ Please set one up with `gptel-make-gh-copilot' first")))))
                    :headers gptel--gh-auth-common-headers
                    :data `( :client_id ,gptel--gh-client-id
                             :scope "read:user"))))
-      ;; Clipboard copy + browser open + minibuffer prompts
-      (gptel-oauth--device-flow-prompt user_code verification_uri)
-      ;; Exchange device_code for access token
+      (gptel-oauth-device-auth-prompt user_code verification_uri)
       (thread-last
         (plist-get
          (gptel--url-retrieve
@@ -298,12 +278,10 @@ Please set one up with `gptel-make-gh-copilot' first")))))
                     :device_code ,device_code
                     :grant_type "urn:ietf:params:oauth:grant-type:device_code"))
          :access_token)
-        (gptel--gh-save gptel-gh-github-token-file)
+        (gptel-auth-save-state gptel-gh-github-token-file)
         (setf (gptel--gh-github-token gh-backend))))
-    ;; Check gh-backend for success
     (if (and (gptel--gh-github-token gh-backend)
-             (not (string-empty-p
-                   (gptel--gh-github-token gh-backend))))
+             (not (string-empty-p (gptel--gh-github-token gh-backend))))
         (message "Successfully logged in to GitHub Copilot.")
       (user-error "Error: You might not have access to GitHub Copilot Chat!"))))
 
@@ -321,7 +299,7 @@ Please set one up with `gptel-make-gh-copilot' first")))))
           (setf (gptel--gh-github-token gptel-backend) nil)
           (user-error "Error: You might not have access to GitHub Copilot Chat!"))
       (thread-last
-        (gptel--gh-save gptel-gh-token-file token)
+        (gptel-auth-save-state gptel-gh-token-file token)
         (setf (gptel--gh-token gptel-backend))))))
 
 (defun gptel--gh-auth ()
@@ -330,38 +308,31 @@ Please set one up with `gptel-make-gh-copilot' first")))))
 We first need github authorization (github token).
 Then we need a session token."
   (unless (gptel--gh-github-token gptel-backend)
-    (let ((token (gptel--gh-restore gptel-gh-github-token-file)))
+    (let ((token (gptel-auth-restore-state gptel-gh-github-token-file)))
       (if token
           (setf (gptel--gh-github-token gptel-backend) token)
         (gptel-gh-login))))
 
   (when (null (gptel--gh-token gptel-backend))
-    ;; try to load token from `gptel-gh-token-file'
     (setf (gptel--gh-token gptel-backend)
-          (gptel--gh-restore gptel-gh-token-file)))
+          (gptel-auth-restore-state gptel-gh-token-file)))
 
   (pcase-let (((map :token :expires_at)
                (gptel--gh-token gptel-backend)))
     (when (or (null token)
-              (and expires_at
-                   (> (round (float-time (current-time)))
-                      expires_at)))
+              (gptel-auth-expires-soon-p expires_at))
       (gptel--gh-renew-token))))
 
 (cl-defmethod gptel-curl--parse-stream ((backend gptel--gh) info)
   (let ((model (plist-get info :model)))
    (if (gptel--model-capable-p 'response-api model)
-       ;; Defer to gptel-openai-responses backend
-       (gptel-curl--parse-stream
-        (gptel--gh-responses-backend backend) info)
+       (gptel-curl--parse-stream (gptel--gh-responses-backend backend) info)
      (cl-call-next-method))))
 
 (cl-defmethod gptel--parse-response ((backend gptel--gh) response info)
   (let ((model (plist-get info :model)))
     (if (gptel--model-capable-p 'response-api model)
-       ;; Defer to gptel-openai-responses backend
-       (gptel--parse-response
-        (gptel--gh-responses-backend backend) response info)
+       (gptel--parse-response (gptel--gh-responses-backend backend) response info)
      (cl-call-next-method))))
 
 (cl-defmethod gptel--request-data ((backend gptel--gh) prompts)
