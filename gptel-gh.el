@@ -1,4 +1,4 @@
-;;; gptel-gh.el ---  Github Copilot AI suppport for gptel  -*- lexical-binding: t; -*-
+;;; gptel-gh.el ---  Github Copilot AI support for gptel  -*- lexical-binding: t; -*-
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -15,7 +15,10 @@
 
 ;;; Commentary:
 
-;; This file adds support for Github Copilot API to gptel
+;; This file adds support for Github Copilot API to gptel.
+;;
+;; Authentication helpers (token persistence, device-flow UX) live in
+;; gptel-oauth.el.
 
 ;;; Code:
 
@@ -25,7 +28,7 @@
   (require 'gptel-request)
   (require 'gptel-openai)
   (require 'gptel-openai-responses))
-(require 'browse-url)
+(require 'gptel-oauth)
 
 ;;; Github Copilot
 (defconst gptel--gh-models
@@ -242,26 +245,16 @@
       (setq hex (nconc hex (list (aref hex-chars (random 16))))))
     (apply #'string hex)))
 
+;; Thin wrappers that supply the appropriate file path to the generic helpers
+;; in gptel-oauth.el.
+
 (defun gptel--gh-restore (file)
   "Restore saved object from FILE."
-  (when (file-exists-p file)
-    ;; We set the coding system to `utf-8-auto-dos' when reading so that
-    ;; files with CR EOL can still be read properly
-    (let ((coding-system-for-read 'utf-8-auto-dos))
-      (with-temp-buffer
-        (set-buffer-multibyte nil)
-        (insert-file-contents-literally file)
-        (goto-char (point-min))
-        (read (current-buffer))))))
+  (gptel-oauth--restore file))
 
 (defun gptel--gh-save (file obj)
   "Save OBJ to FILE."
-  (let ((print-length nil)
-        (print-level nil)
-        (coding-system-for-write 'utf-8-unix))
-    (make-directory (file-name-directory file) t)
-    (write-region (prin1-to-string obj) nil file nil :silent)
-    obj))
+  (gptel-oauth--save file obj))
 
 (defun gptel-gh-login ()
   "Login to GitHub Copilot API.
@@ -284,11 +277,7 @@ instead of attempting to open a browser automatically."
                        (mapcar #'cdr gptel--known-backends)))
           ;; No GitHub backend found
           (t (user-error "No GitHub Copilot backend found.  \
-Please set one up with `gptel-make-gh-copilot' first"))))
-        ;; Detect SSH sessions
-        (in-ssh-session (or (getenv "SSH_CLIENT")
-                            (getenv "SSH_CONNECTION")
-                            (getenv "SSH_TTY"))))
+Please set one up with `gptel-make-gh-copilot' first")))))
     (pcase-let (((map :device_code :user_code :verification_uri)
                  (gptel--url-retrieve
                      "https://github.com/login/device/code"
@@ -296,24 +285,9 @@ Please set one up with `gptel-make-gh-copilot' first"))))
                    :headers gptel--gh-auth-common-headers
                    :data `( :client_id ,gptel--gh-client-id
                             :scope "read:user"))))
-      (gui-set-selection 'CLIPBOARD user_code)
-      (if in-ssh-session
-          ;; SSH session: display URL and code, don't auto-open browser
-          (progn
-            (message "GitHub Device Code: %s (copied to clipboard)" user_code)
-            (read-from-minibuffer
-             (format "Code %s is copied. Visit https://github.com/login/device \
-in your local browser, enter the code, and authorize.  Press ENTER after authorizing. "
-                     user_code)))
-        ;; Local session: auto-open browser
-        (read-from-minibuffer
-         (format "Your one-time code %s is copied. \
-Press ENTER to open GitHub in your browser. \
-If your browser does not open automatically, browse to %s."
-                 user_code verification_uri))
-        (browse-url verification_uri)
-        (read-from-minibuffer "Press ENTER after authorizing. "))
-      ;; Use gh-backend for token storage
+      ;; Clipboard copy + browser open + minibuffer prompts
+      (gptel-oauth--device-flow-prompt user_code verification_uri)
+      ;; Exchange device_code for access token
       (thread-last
         (plist-get
          (gptel--url-retrieve
