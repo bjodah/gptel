@@ -27,7 +27,6 @@
 (require 'url-http)
 (eval-and-compile (require 'gptel-request))
 
-
 ;;; Token Storage
 
 (defun gptel-oauth-save-token (file token)

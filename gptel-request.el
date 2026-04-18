@@ -986,17 +986,38 @@ MODE-SYM is typically a major-mode symbol."
 (defvar url-http-end-of-headers)
 (defvar url-http-response-status)
 (cl-defun gptel--url-retrieve (url &key method data headers)
-  "Retrieve URL synchronously with METHOD, DATA and HEADERS."
+  "Retrieve URL synchronously with METHOD, DATA and HEADERS.
+By default, JSON-encodes DATA and uses application/json.
+If DATA is a string and a custom content-type is provided in HEADERS,
+it sends DATA as-is."
   (declare (indent 1))
-  (let ((url-request-method (if (eq method 'post) "POST" "GET"))
-        (url-request-data (when (eq method 'post) (encode-coding-string (gptel--json-encode data) 'utf-8)))
-        (url-mime-accept-string "application/json")
-        (url-request-extra-headers
-         `(("content-type" . "application/json")
-           ,@headers)))
-    (with-current-buffer (url-retrieve-synchronously url 'silent)
-      (goto-char url-http-end-of-headers)
-      (gptel--json-read))))
+  (let* ((url-request-method (if (eq method 'post) "POST" "GET"))
+         (custom-ct (assoc-string "content-type" headers t))
+         (content-type (or (cdr custom-ct) "application/json"))
+         (url-request-data
+          (when (and data (eq method 'post))
+            (encode-coding-string
+             (if (and (stringp data) (not (string-prefix-p "application/json" content-type)))
+                 data
+               (gptel--json-encode data))
+             'utf-8)))
+         (url-mime-accept-string "application/json")
+         (url-request-extra-headers
+          (if custom-ct
+              headers
+            `(("content-type" . "application/json") ,@headers)))
+         (buf (url-retrieve-synchronously url 'silent)))
+    (unwind-protect
+        (if (not (buffer-live-p buf))
+            nil
+          (with-current-buffer buf
+            (when (bound-and-true-p url-http-end-of-headers)
+              (goto-char url-http-end-of-headers)
+              (condition-case nil
+                  (gptel--json-read)
+                (error nil)))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
 
 (defsubst gptel-prompt-prefix-string ()
   "Prefix before user prompts in `gptel-mode'."
