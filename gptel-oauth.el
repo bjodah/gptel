@@ -70,48 +70,53 @@ Copies USER-CODE to the clipboard and conditionally opens a browser."
       (browse-url verification-uri)
       (read-from-minibuffer "Press ENTER after authorizing. "))))
 
-(cl-defun gptel-oauth-request (url &key (method 'post) data content-type headers)
-  "Retrieve URL synchronously and return (:status N :body PLIST :raw STRING).
+(defun gptel-oauth-base64url-decode (str)
+  "Decode Base64URL string STR, adding padding if necessary."
+  (let* ((str (replace-regexp-in-string "-" "+" str))
+         (str (replace-regexp-in-string "_" "/" str))
+         (pad (% (length str) 4)))
+    (when (> pad 0)
+      (setq str (concat str (make-string (- 4 pad) ?=))))
+    (decode-coding-string (base64-decode-string str) 'utf-8 t)))
 
-METHOD is a symbol, typically 'get or 'post.
-CONTENT-TYPE defaults to \"application/json\".  When CONTENT-TYPE is
-\"application/x-www-form-urlencoded\", DATA should be an already-encoded string.
-When CONTENT-TYPE is \"application/json\", DATA should be a plist.
-HEADERS is an alist of additional headers."
-  (let* ((content-type (or content-type "application/json"))
-         (url-request-method (upcase (symbol-name method)))
-         (url-request-data
-          (when data
-            (encode-coding-string
-             (cond
-              ((string-prefix-p "application/json" content-type)
-               (gptel--json-encode data))
-              (t data))
-             'utf-8)))
-         (url-request-extra-headers
-          `(("Content-Type" . ,content-type)
-            ("Accept" . "application/json")
-            ,@headers))
-         (url-mime-accept-string "application/json")
-         (buf (url-retrieve-synchronously url 'silent)))
-    (unwind-protect
-        (if (not (buffer-live-p buf))
-            (list :status nil :body nil :raw "")
-          (with-current-buffer buf
-            (let ((status (bound-and-true-p url-http-response-status))
-                  (raw-body "")
-                  (parsed nil))
-              (when (bound-and-true-p url-http-end-of-headers)
-                (goto-char url-http-end-of-headers)
-                (setq raw-body (buffer-substring-no-properties (point) (point-max)))
-                (condition-case nil
-                    (progn
-                      (goto-char url-http-end-of-headers)
-                      (setq parsed (gptel--json-read)))
-                  (error nil)))
-              (list :status status :body parsed :raw raw-body))))
-      (when (buffer-live-p buf)
-        (kill-buffer buf)))))
+(defun gptel-oauth-base64url-encode (str)
+  "Base64url encode STR."
+  (let ((b64 (base64-encode-string str t)))
+    (setq b64 (replace-regexp-in-string "\\+" "-" b64))
+    (setq b64 (replace-regexp-in-string "/" "_" b64))
+    (replace-regexp-in-string "=+$" "" b64)))
+
+(defun gptel-oauth-generate-code-verifier ()
+  "Generate PKCE code verifier."
+  (let ((chars "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"))
+    (apply #'string
+           (cl-loop repeat 128
+                    collect (aref chars (random (length chars)))))))
+
+(defun gptel-oauth-generate-code-challenge (verifier)
+  "Generate PKCE code challenge from VERIFIER."
+  (gptel-oauth-base64url-encode
+   (secure-hash 'sha256 verifier nil nil t)))
+
+(defun gptel-oauth-jwt-payload (jwt-string)
+  "Parse the payload of JWT-STRING and return it as a plist.
+Returns nil if parsing fails."
+  (condition-case nil
+      (let* ((parts (split-string jwt-string "\\."))
+             (payload (nth 1 parts)))
+        (when payload
+          (gptel--json-read-string
+           (gptel-oauth-base64url-decode payload))))
+    (error nil)))
+
+(defun gptel-oauth-url-encode-params (params)
+  "Encode PARAMS alist as application/x-www-form-urlencoded string.
+PARAMS is an alist of (KEY . VALUE) string pairs."
+  (mapconcat (lambda (pair)
+               (concat (url-hexify-string (car pair))
+                       "="
+                       (url-hexify-string (cdr pair))))
+             params "&"))
 
 (provide 'gptel-oauth)
 
