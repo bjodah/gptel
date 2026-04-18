@@ -306,7 +306,10 @@ Please set one up with `gptel-make-gh-copilot' first")))))
                                   :grant_type "urn:ietf:params:oauth:grant-type:device_code"))))
         (thread-last
             (plist-get resp-body :access_token)
-          (gptel-oauth-save-token gptel-gh-github-token-file)
+          (gptel-oauth-save-token
+           gptel-gh-github-token-file
+           :directory-mode #o700
+           :file-mode #o600)
           (setf (gptel--gh-github-token gh-backend)))))
     ;; Check gh-backend for success
     (if (and (gptel--gh-github-token gh-backend)
@@ -329,7 +332,10 @@ Please set one up with `gptel-make-gh-copilot' first")))))
           (setf (gptel--gh-github-token gptel-backend) nil)
           (user-error "Error: You might not have access to GitHub Copilot Chat!"))
       (thread-last token
-        (gptel-oauth-save-token gptel-gh-token-file)
+        (gptel-oauth-save-token
+         gptel-gh-token-file
+         :directory-mode #o700
+         :file-mode #o600)
         (setf (gptel--gh-token gptel-backend))))))
 
 (defun gptel--gh-auth ()

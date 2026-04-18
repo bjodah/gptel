@@ -24,18 +24,24 @@
 
 (require 'cl-lib)
 (require 'browse-url)
-(require 'url-http)
+(require 'url-util)
 (eval-and-compile (require 'gptel-request))
 
 ;;; Token Storage
 
-(defun gptel-oauth-save-token (file token)
-  "Save TOKEN plist to FILE."
+(cl-defun gptel-oauth-save-token (file token &key file-mode directory-mode)
+  "Save TOKEN plist to FILE.
+Optional FILE-MODE and DIRECTORY-MODE set permissions on the
+token file and its parent directory respectively (e.g. #o600)."
   (let ((print-length nil)
         (print-level nil)
         (coding-system-for-write 'utf-8-unix))
     (make-directory (file-name-directory file) t)
+    (when directory-mode
+      (set-file-modes (file-name-directory file) directory-mode))
     (write-region (prin1-to-string token) nil file nil :silent)
+    (when file-mode
+      (set-file-modes file file-mode))
     token))
 
 (defun gptel-oauth-restore-token (file)
