@@ -24,7 +24,7 @@
 
 (require 'cl-lib)
 (require 'browse-url)
-(require 'url-http)
+(require 'url-util)
 (eval-and-compile (require 'gptel-request))
 
 ;;; Token Storage
@@ -104,6 +104,7 @@ Copies USER-CODE to the clipboard and conditionally opens a browser."
 
 ;;; URL / JWT helpers
 
+
 (defun gptel-oauth-jwt-payload (jwt-string)
   "Parse the payload of JWT-STRING and return it as a plist.
 Returns nil if parsing fails."
@@ -123,6 +124,15 @@ PARAMS is an alist of (KEY . VALUE) string pairs."
                        "="
                        (url-hexify-string (cdr pair))))
              params "&"))
+
+;;; Browser authorization-code flow
+
+(defun gptel-oauth-browse-and-read-authorization-code (auth-url &optional prompt)
+  "Open AUTH-URL in a browser and read the authorization code from the user.
+PROMPT is an optional minibuffer prompt string.  Returns the raw
+user input unchanged."
+  (browse-url auth-url)
+  (read-string (or prompt "Paste the authorization code from the browser: ")))
 
 (provide 'gptel-oauth)
 

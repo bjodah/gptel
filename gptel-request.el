@@ -985,18 +985,66 @@ MODE-SYM is typically a major-mode symbol."
 
 (defvar url-http-end-of-headers)
 (defvar url-http-response-status)
-(cl-defun gptel--url-retrieve (url &key method data headers)
-  "Retrieve URL synchronously with METHOD, DATA and HEADERS."
+(cl-defun gptel--url-retrieve (url &key method data headers content-type full)
+  "Retrieve URL synchronously with METHOD, DATA and HEADERS.
+
+METHOD is a symbol such as `post' or `get' (default `post' when
+DATA is non-nil, `get' otherwise).
+
+DATA is the request body.  When CONTENT-TYPE is JSON (the default)
+it should be a plist that will be JSON-encoded.  When CONTENT-TYPE
+is something else (e.g. \"application/x-www-form-urlencoded\") it
+should be a pre-encoded string.
+
+HEADERS is an alist of additional HTTP headers.
+
+CONTENT-TYPE (string) sets the Content-Type header; defaults to
+\"application/json\".
+
+When FULL is non-nil, return a plist
+  (:status STATUS :body PARSED-BODY :raw RAW-STRING)
+instead of just the parsed JSON body.  JSON parse failures in
+full mode set :body to nil and populate :raw."
   (declare (indent 1))
-  (let ((url-request-method (if (eq method 'post) "POST" "GET"))
-        (url-request-data (when (eq method 'post) (encode-coding-string (gptel--json-encode data) 'utf-8)))
-        (url-mime-accept-string "application/json")
-        (url-request-extra-headers
-         `(("content-type" . "application/json")
-           ,@headers)))
-    (with-current-buffer (url-retrieve-synchronously url 'silent)
-      (goto-char url-http-end-of-headers)
-      (gptel--json-read))))
+  (let* ((content-type (or content-type "application/json"))
+         (method (or method (if data 'post 'get)))
+         (url-request-method (upcase (symbol-name method)))
+         (url-request-data
+          (when data
+            (encode-coding-string
+             (if (string-prefix-p "application/json" content-type)
+                 (gptel--json-encode data)
+               data)
+             'utf-8)))
+         (url-mime-accept-string "application/json")
+         (url-request-extra-headers
+          `(("Content-Type" . ,content-type)
+            ("Accept" . "application/json")
+            ,@headers))
+         (buf (url-retrieve-synchronously url 'silent)))
+    (unwind-protect
+        (if (not (buffer-live-p buf))
+            (if full (list :status nil :body nil :raw "") nil)
+          (with-current-buffer buf
+            (if full
+                (let ((status (bound-and-true-p url-http-response-status))
+                      (raw-body "")
+                      (parsed nil))
+                  (when (bound-and-true-p url-http-end-of-headers)
+                    (goto-char url-http-end-of-headers)
+                    (setq raw-body (buffer-substring-no-properties
+                                    (point) (point-max)))
+                    (condition-case nil
+                        (progn
+                          (goto-char url-http-end-of-headers)
+                          (setq parsed (gptel--json-read)))
+                      (error nil)))
+                  (list :status status :body parsed :raw raw-body))
+              ;; Legacy mode: return parsed JSON only
+              (goto-char url-http-end-of-headers)
+              (gptel--json-read))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
 
 (defsubst gptel-prompt-prefix-string ()
   "Prefix before user prompts in `gptel-mode'."
