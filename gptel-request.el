@@ -985,7 +985,7 @@ MODE-SYM is typically a major-mode symbol."
 
 (defvar url-http-end-of-headers)
 (defvar url-http-response-status)
-(cl-defun gptel--url-retrieve (url &key method data headers content-type full)
+(cl-defun gptel--url-retrieve (url &key method data headers content-type accept full)
   "Retrieve URL synchronously with METHOD, DATA and HEADERS.
 
 METHOD is a symbol such as `post' or `get' (default `post' when
@@ -1001,12 +1001,16 @@ HEADERS is an alist of additional HTTP headers.
 CONTENT-TYPE (string) sets the Content-Type header; defaults to
 \"application/json\".
 
+ACCEPT (string) sets the Accept header; defaults to
+\"application/json\".
+
 When FULL is non-nil, return a plist
   (:status STATUS :body PARSED-BODY :raw RAW-STRING)
 instead of just the parsed JSON body.  JSON parse failures in
 full mode set :body to nil and populate :raw."
   (declare (indent 1))
   (let* ((content-type (or content-type "application/json"))
+         (accept (or accept "application/json"))
          (method (or method (if data 'post 'get)))
          (url-request-method (upcase (symbol-name method)))
          (url-request-data
@@ -1016,15 +1020,19 @@ full mode set :body to nil and populate :raw."
                  (gptel--json-encode data)
                data)
              'utf-8)))
-         (url-mime-accept-string "application/json")
+         (url-mime-accept-string accept)
          (url-request-extra-headers
           `(("Content-Type" . ,content-type)
-            ("Accept" . "application/json")
+            ("Accept" . ,accept)
             ,@headers))
          (buf (url-retrieve-synchronously url 'silent)))
     (unwind-protect
         (if (not (buffer-live-p buf))
-            (if full (list :status nil :body nil :raw "") nil)
+            (if full
+                (list :status nil :body nil :raw "")
+              ;; Legacy path: signal an error, matching the original
+              ;; behavior where (with-current-buffer nil ...) would fail.
+              (error "gptel--url-retrieve: request to %s failed" url))
           (with-current-buffer buf
             (if full
                 (let ((status (bound-and-true-p url-http-response-status))

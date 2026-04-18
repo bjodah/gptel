@@ -27,13 +27,19 @@
 (require 'url-util)
 (eval-and-compile (require 'gptel-request))
 
-(defun gptel-oauth-save-token (file token)
-  "Save TOKEN plist to FILE."
+(cl-defun gptel-oauth-save-token (file token &key file-mode directory-mode)
+  "Save TOKEN plist to FILE.
+Optional FILE-MODE and DIRECTORY-MODE set permissions on the
+token file and its parent directory respectively (e.g. #o600)."
   (let ((print-length nil)
         (print-level nil)
         (coding-system-for-write 'utf-8-unix))
     (make-directory (file-name-directory file) t)
+    (when directory-mode
+      (set-file-modes (file-name-directory file) directory-mode))
     (write-region (prin1-to-string token) nil file nil :silent)
+    (when file-mode
+      (set-file-modes file file-mode))
     token))
 
 (defun gptel-oauth-restore-token (file)
@@ -88,7 +94,12 @@ Copies USER-CODE to the clipboard and conditionally opens a browser."
 
 (defun gptel-oauth-generate-pkce-verifier (&optional length)
   "Generate a PKCE code verifier string of LENGTH characters (default 128).
-Uses the unreserved character set from RFC 7636."
+Uses the unreserved character set from RFC 7636.
+
+NOTE: Emacs' `random' is not a cryptographically secure RNG.
+This is acceptable for PKCE verifiers in interactive desktop
+flows, but callers requiring cryptographic randomness should
+replace this with a /dev/urandom-backed generator."
   (let ((chars "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
         (len (or length 128)))
     (apply #'string
@@ -127,9 +138,22 @@ Returns nil if parsing fails."
 (defun gptel-oauth-browse-and-read-authorization-code (auth-url &optional prompt)
   "Open AUTH-URL in a browser and read the authorization code from the user.
 PROMPT is an optional minibuffer prompt string.  Returns the raw
-user input unchanged."
-  (browse-url auth-url)
-  (read-string (or prompt "Paste the authorization code from the browser: ")))
+user input unchanged.
+
+In SSH sessions the URL is displayed for manual copying instead
+of attempting to open a browser on the remote host.  The code is
+read with `read-passwd' to avoid echoing and minibuffer history."
+  (let ((in-ssh-session (or (getenv "SSH_CLIENT")
+                            (getenv "SSH_CONNECTION")
+                            (getenv "SSH_TTY")))
+        (prompt (or prompt "Paste the authorization code from the browser: ")))
+    (if in-ssh-session
+        (progn
+          (message "Opening authorization URL for manual copy...")
+          (read-passwd
+           (format "Visit %s in your local browser, then:\n%s" auth-url prompt)))
+      (browse-url auth-url)
+      (read-passwd prompt))))
 
 (provide 'gptel-oauth)
 
