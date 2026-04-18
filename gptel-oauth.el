@@ -29,13 +29,19 @@
 
 ;;; Token Storage
 
-(defun gptel-oauth-save-token (file token)
-  "Save TOKEN plist to FILE."
+(cl-defun gptel-oauth-save-token (file token &key file-mode directory-mode)
+  "Save TOKEN plist to FILE.
+Optional FILE-MODE and DIRECTORY-MODE set permissions on the
+token file and its parent directory respectively (e.g. #o600)."
   (let ((print-length nil)
         (print-level nil)
         (coding-system-for-write 'utf-8-unix))
     (make-directory (file-name-directory file) t)
+    (when directory-mode
+      (set-file-modes (file-name-directory file) directory-mode))
     (write-region (prin1-to-string token) nil file nil :silent)
+    (when file-mode
+      (set-file-modes file file-mode))
     token))
 
 (defun gptel-oauth-restore-token (file)
@@ -104,7 +110,6 @@ Copies USER-CODE to the clipboard and conditionally opens a browser."
 
 ;;; URL / JWT helpers
 
-
 (defun gptel-oauth-jwt-payload (jwt-string)
   "Parse the payload of JWT-STRING and return it as a plist.
 Returns nil if parsing fails."
@@ -124,15 +129,6 @@ PARAMS is an alist of (KEY . VALUE) string pairs."
                        "="
                        (url-hexify-string (cdr pair))))
              params "&"))
-
-;;; Browser authorization-code flow
-
-(defun gptel-oauth-browse-and-read-authorization-code (auth-url &optional prompt)
-  "Open AUTH-URL in a browser and read the authorization code from the user.
-PROMPT is an optional minibuffer prompt string.  Returns the raw
-user input unchanged."
-  (browse-url auth-url)
-  (read-string (or prompt "Paste the authorization code from the browser: ")))
 
 (provide 'gptel-oauth)
 
