@@ -25,7 +25,7 @@
   (require 'gptel-request)
   (require 'gptel-openai)
   (require 'gptel-openai-responses))
-(require 'browse-url)
+(require 'gptel-oauth)
 
 ;;; Github Copilot
 (defconst gptel--gh-models
@@ -48,7 +48,7 @@
      :cutoff-date "2023-09")
     (gpt-5-mini
      :description "Faster, more cost-efficient version of GPT-5"
-     :capabilities (media tool-use json url response-api)
+     :capabilities (media tool-use json url responses-api)
      :mime-types ("image/jpeg" "image/png" "image/gif" "image/webp")
      :context-window 128
      :input-cost 0
@@ -56,7 +56,7 @@
      :cutoff-date "2024-06")
     (gpt-5.1
      :description "The best model for coding and agentic tasks"
-     :capabilities (media tool-use json url response-api)
+     :capabilities (media tool-use json url responses-api)
      :mime-types ("image/jpeg" "image/png" "image/gif" "image/webp")
      :context-window 128
      :input-cost 1
@@ -64,7 +64,7 @@
      :cutoff-date "2024-09")
     (gpt-5.1-codex
      :description "Flagship model for coding, reasoning, and agentic tasks across domains"
-     :capabilities (media tool-use json url response-api)
+     :capabilities (media tool-use json url responses-api)
      :mime-types ("image/jpeg" "image/png" "image/gif" "image/webp")
      :context-window 128
      :input-cost 1
@@ -72,7 +72,7 @@
      :cutoff-date "2024-09")
     (gpt-5.1-codex-max
      :description "Flagship model for coding, reasoning, and agentic tasks across domains"
-     :capabilities (media tool-use json url response-api)
+     :capabilities (media tool-use json url responses-api)
      :mime-types ("image/jpeg" "image/png" "image/gif" "image/webp")
      :context-window 128
      :input-cost 1
@@ -80,7 +80,7 @@
      :cutoff-date "2024-09")
     (gpt-5.1-codex-mini
      :description "Flagship model for coding, reasoning, and agentic tasks across domains"
-     :capabilities (media tool-use json url response-api)
+     :capabilities (media tool-use json url responses-api)
      :mime-types ("image/jpeg" "image/png" "image/gif" "image/webp")
      :context-window 128
      :input-cost 1
@@ -88,7 +88,7 @@
      :cutoff-date "2024-09")
     (gpt-5.2
      :description "The best model for coding and agentic tasks"
-     :capabilities (media tool-use json url response-api)
+     :capabilities (media tool-use json url responses-api)
      :mime-types ("image/jpeg" "image/png" "image/gif" "image/webp")
      :context-window 128
      :input-cost 1
@@ -96,12 +96,44 @@
      :cutoff-date "2025-08")
     (gpt-5.2-codex
      :description "The best model for coding and agentic tasks"
-     :capabilities (media tool-use json url response-api)
+     :capabilities (media tool-use json url responses-api)
      :mime-types ("image/jpeg" "image/png" "image/gif" "image/webp")
      :context-window 272
      :input-cost 1
      :output-cost 1
      :cutoff-date "2025-08")
+    (gpt-5.3-codex
+     :description "The most capable agentic coding model to date"
+     :capabilities (media tool-use json url responses-api)
+     :mime-types ("image/jpeg" "image/png" "image/gif" "image/webp")
+     :context-window 400
+     :input-cost 1
+     :output-cost 1
+     :cutoff-date "2025-08")
+    (gpt-5.4
+     :description "Best intelligence at scale for agentic, coding, and professional workflows"
+     :capabilities (media tool-use json url responses-api)
+     :mime-types ("image/jpeg" "image/png" "image/gif" "image/webp")
+     :context-window 400
+     :input-cost 1
+     :output-cost 1
+     :cutoff-date "2025-08")
+    (gpt-5.4-mini
+     :description "Strongest mini model yet for coding, computer use, and subagent"
+     :capabilities (media tool-use json url responses-api)
+     :mime-types ("image/jpeg" "image/png" "image/gif" "image/webp")
+     :context-window 400
+     :input-cost 0.33
+     :output-cost 0.33
+     :cutoff-date "2025-08")
+    (gpt-5.5
+     :description "GitHub Copilot GPT-5.5"
+     :capabilities (media tool-use json url responses-api)
+     :mime-types ("image/jpeg" "image/png" "image/gif" "image/webp")
+     :context-window 400
+     :input-cost 1
+     :output-cost 1
+     :cutoff-date "2026-04")
     (claude-haiku-4.5
      :description "Near-frontier intelligence at blazing speeds with extended thinking"
      :capabilities (media tool-use cache)
@@ -119,6 +151,14 @@
      :output-cost 3
      :cutoff-date "2025-03")
     (claude-opus-4.6
+     :description "Most capable model for complex reasoning and advanced coding"
+     :capabilities (media tool-use cache)
+     :mime-types ("image/jpeg" "image/png" "image/gif" "image/webp" "application/pdf")
+     :context-window 128
+     :input-cost 3
+     :output-cost 3
+     :cutoff-date "2025-03")
+    (claude-opus-4.7
      :description "Most capable model for complex reasoning and advanced coding"
      :capabilities (media tool-use cache)
      :mime-types ("image/jpeg" "image/png" "image/gif" "image/webp" "application/pdf")
@@ -242,27 +282,6 @@
       (setq hex (nconc hex (list (aref hex-chars (random 16))))))
     (apply #'string hex)))
 
-(defun gptel--gh-restore (file)
-  "Restore saved object from FILE."
-  (when (file-exists-p file)
-    ;; We set the coding system to `utf-8-auto-dos' when reading so that
-    ;; files with CR EOL can still be read properly
-    (let ((coding-system-for-read 'utf-8-auto-dos))
-      (with-temp-buffer
-        (set-buffer-multibyte nil)
-        (insert-file-contents-literally file)
-        (goto-char (point-min))
-        (read (current-buffer))))))
-
-(defun gptel--gh-save (file obj)
-  "Save OBJ to FILE."
-  (let ((print-length nil)
-        (print-level nil)
-        (coding-system-for-write 'utf-8-unix))
-    (make-directory (file-name-directory file) t)
-    (write-region (prin1-to-string obj) nil file nil :silent)
-    obj))
-
 (defun gptel-gh-login ()
   "Login to GitHub Copilot API.
 
@@ -284,48 +303,27 @@ instead of attempting to open a browser automatically."
                        (mapcar #'cdr gptel--known-backends)))
           ;; No GitHub backend found
           (t (user-error "No GitHub Copilot backend found.  \
-Please set one up with `gptel-make-gh-copilot' first"))))
-        ;; Detect SSH sessions
-        (in-ssh-session (or (getenv "SSH_CLIENT")
-                            (getenv "SSH_CONNECTION")
-                            (getenv "SSH_TTY"))))
+Please set one up with `gptel-make-gh-copilot' first")))))
     (pcase-let (((map :device_code :user_code :verification_uri)
-                 (gptel--url-retrieve
-                     "https://github.com/login/device/code"
-                   :method 'post
-                   :headers gptel--gh-auth-common-headers
-                   :data `( :client_id ,gptel--gh-client-id
-                            :scope "read:user"))))
-      (gui-set-selection 'CLIPBOARD user_code)
-      (if in-ssh-session
-          ;; SSH session: display URL and code, don't auto-open browser
-          (progn
-            (message "GitHub Device Code: %s (copied to clipboard)" user_code)
-            (read-from-minibuffer
-             (format "Code %s is copied. Visit https://github.com/login/device \
-in your local browser, enter the code, and authorize.  Press ENTER after authorizing. "
-                     user_code)))
-        ;; Local session: auto-open browser
-        (read-from-minibuffer
-         (format "Your one-time code %s is copied. \
-Press ENTER to open GitHub in your browser. \
-If your browser does not open automatically, browse to %s."
-                 user_code verification_uri))
-        (browse-url verification_uri)
-        (read-from-minibuffer "Press ENTER after authorizing. "))
+                 (plist-get
+                  (gptel-oauth-request "https://github.com/login/device/code"
+                                       :headers gptel--gh-auth-common-headers
+                                       :data `( :client_id ,gptel--gh-client-id
+                                                :scope "read:user"))
+                  :body)))
+      (gptel-oauth-device-auth-prompt user_code verification_uri)
       ;; Use gh-backend for token storage
-      (thread-last
-        (plist-get
-         (gptel--url-retrieve
-             "https://github.com/login/oauth/access_token"
-           :method 'post
-           :headers gptel--gh-auth-common-headers
-           :data `( :client_id ,gptel--gh-client-id
-                    :device_code ,device_code
-                    :grant_type "urn:ietf:params:oauth:grant-type:device_code"))
-         :access_token)
-        (gptel--gh-save gptel-gh-github-token-file)
-        (setf (gptel--gh-github-token gh-backend))))
+      (let ((resp-body (plist-get
+                        (gptel-oauth-request "https://github.com/login/oauth/access_token"
+                                             :headers gptel--gh-auth-common-headers
+                                             :data `( :client_id ,gptel--gh-client-id
+                                                      :device_code ,device_code
+                                                      :grant_type "urn:ietf:params:oauth:grant-type:device_code"))
+                        :body)))
+        (thread-last
+            (plist-get resp-body :access_token)
+          (gptel-oauth-save-token gptel-gh-github-token-file)
+          (setf (gptel--gh-github-token gh-backend)))))
     ;; Check gh-backend for success
     (if (and (gptel--gh-github-token gh-backend)
              (not (string-empty-p
@@ -336,18 +334,19 @@ If your browser does not open automatically, browse to %s."
 (defun gptel--gh-renew-token ()
   "Renew session token."
   (let ((token
-         (gptel--url-retrieve
-             "https://api.github.com/copilot_internal/v2/token"
-           :method 'get
-           :headers `(("authorization"
-                       . ,(format "token %s" (gptel--gh-github-token gptel-backend)))
-                      ,@gptel--gh-auth-common-headers))))
+         (plist-get
+          (gptel-oauth-request "https://api.github.com/copilot_internal/v2/token"
+                               :method 'get
+                               :headers `(("authorization"
+                                           . ,(format "token %s" (gptel--gh-github-token gptel-backend)))
+                                          ,@gptel--gh-auth-common-headers))
+          :body)))
     (if (not (plist-get token :token))
         (progn
           (setf (gptel--gh-github-token gptel-backend) nil)
           (user-error "Error: You might not have access to GitHub Copilot Chat!"))
-      (thread-last
-        (gptel--gh-save gptel-gh-token-file token)
+      (thread-last token
+        (gptel-oauth-save-token gptel-gh-token-file)
         (setf (gptel--gh-token gptel-backend))))))
 
 (defun gptel--gh-auth ()
@@ -356,7 +355,7 @@ If your browser does not open automatically, browse to %s."
 We first need github authorization (github token).
 Then we need a session token."
   (unless (gptel--gh-github-token gptel-backend)
-    (let ((token (gptel--gh-restore gptel-gh-github-token-file)))
+    (let ((token (gptel-oauth-restore-token gptel-gh-github-token-file)))
       (if token
           (setf (gptel--gh-github-token gptel-backend) token)
         (gptel-gh-login))))
@@ -364,7 +363,7 @@ Then we need a session token."
   (when (null (gptel--gh-token gptel-backend))
     ;; try to load token from `gptel-gh-token-file'
     (setf (gptel--gh-token gptel-backend)
-          (gptel--gh-restore gptel-gh-token-file)))
+          (gptel-oauth-restore-token gptel-gh-token-file)))
 
   (pcase-let (((map :token :expires_at)
                (gptel--gh-token gptel-backend)))
@@ -376,7 +375,7 @@ Then we need a session token."
 
 (cl-defmethod gptel-curl--parse-stream ((backend gptel--gh) info)
   (let ((model (plist-get info :model)))
-   (if (gptel--model-capable-p 'response-api model)
+   (if (gptel--model-capable-p 'responses-api model)
        ;; Defer to gptel-openai-responses backend
        (gptel-curl--parse-stream
         (gptel--gh-responses-backend backend) info)
@@ -384,82 +383,75 @@ Then we need a session token."
 
 (cl-defmethod gptel--parse-response ((backend gptel--gh) response info)
   (let ((model (plist-get info :model)))
-    (if (gptel--model-capable-p 'response-api model)
+    (if (gptel--model-capable-p 'responses-api model)
        ;; Defer to gptel-openai-responses backend
        (gptel--parse-response
         (gptel--gh-responses-backend backend) response info)
      (cl-call-next-method))))
 
 (cl-defmethod gptel--request-data ((backend gptel--gh) prompts)
-  (let ((model gptel-model))
-    (if (gptel--model-capable-p 'response-api model)
-        (gptel--request-data (gptel--gh-responses-backend backend) prompts)
-      (cl-call-next-method))))
+  (if (gptel--model-capable-p 'responses-api gptel-model)
+      (gptel--request-data (gptel--gh-responses-backend backend) prompts)
+    (cl-call-next-method)))
 
 (cl-defmethod gptel--parse-schema ((backend gptel--gh) schema)
-  (let ((model gptel-model))
-    (if (gptel--model-capable-p 'response-api model)
-        (gptel--parse-schema (gptel--gh-responses-backend backend) schema)
-      (cl-call-next-method))))
+  (if (gptel--model-capable-p 'responses-api gptel-model)
+      (gptel--parse-schema (gptel--gh-responses-backend backend) schema)
+    (cl-call-next-method)))
 
 (cl-defmethod gptel--parse-tools ((backend gptel--gh) tools)
-  (let ((model gptel-model))
-    (if (gptel--model-capable-p 'response-api model)
-        (gptel--parse-tools (gptel--gh-responses-backend backend) tools)
-      (cl-call-next-method))))
+  (if (gptel--model-capable-p 'responses-api gptel-model)
+      (gptel--parse-tools (gptel--gh-responses-backend backend) tools)
+    (cl-call-next-method)))
 
 (cl-defmethod gptel--inject-tool-call ((backend gptel--gh) data tool-call new-call)
-  (let ((model gptel-model))
-    (if (gptel--model-capable-p 'response-api model)
-        (gptel--inject-tool-call (gptel--gh-responses-backend backend) data tool-call new-call)
-      (cl-call-next-method))))
+  (if (gptel--model-capable-p 'responses-api gptel-model)
+      (gptel--inject-tool-call (gptel--gh-responses-backend backend) data tool-call new-call)
+    (cl-call-next-method)))
 
 (cl-defmethod gptel--parse-tool-results ((backend gptel--gh) tool-use)
-  (let ((model gptel-model))
-    (if (gptel--model-capable-p 'response-api model)
-        (gptel--parse-tool-results (gptel--gh-responses-backend backend) tool-use)
-      (cl-call-next-method))))
+  (if (gptel--model-capable-p 'responses-api gptel-model)
+      (gptel--parse-tool-results (gptel--gh-responses-backend backend) tool-use)
+    (cl-call-next-method)))
 
-(cl-defmethod gptel--inject-prompt
-  ((backend gptel--gh) data new-prompt &optional position)
-  (let ((model gptel-model))
-    (if (gptel--model-capable-p 'response-api model)
-        (gptel--inject-prompt (gptel--gh-responses-backend backend) data new-prompt position)
-      (cl-call-next-method))))
+(cl-defmethod gptel--inject-prompt ((backend gptel--gh) data new-prompt &optional position)
+  (if (gptel--model-capable-p 'responses-api gptel-model)
+      (gptel--inject-prompt (gptel--gh-responses-backend backend) data new-prompt position)
+    (cl-call-next-method)))
 
 (cl-defmethod gptel--parse-list ((backend gptel--gh) prompt-list)
-  (let ((model gptel-model))
-    (if (gptel--model-capable-p 'response-api model)
-        (gptel--parse-list (gptel--gh-responses-backend backend) prompt-list)
-      (cl-call-next-method))))
+  (if (gptel--model-capable-p 'responses-api gptel-model)
+      (gptel--parse-list (gptel--gh-responses-backend backend) prompt-list)
+    (cl-call-next-method)))
 
 (cl-defmethod gptel--parse-buffer ((backend gptel--gh) &optional max-entries)
-  (let ((model gptel-model))
-    (if (gptel--model-capable-p 'response-api model)
-        (gptel--parse-buffer (gptel--gh-responses-backend backend) max-entries)
-      (cl-call-next-method))))
+  (if (gptel--model-capable-p 'responses-api gptel-model)
+      (gptel--parse-buffer (gptel--gh-responses-backend backend) max-entries)
+    (cl-call-next-method)))
 
 (cl-defmethod gptel--inject-media ((backend gptel--gh) prompts)
-  (let ((model gptel-model))
-    (if (gptel--model-capable-p 'response-api model)
-        (gptel--inject-media (gptel--gh-responses-backend backend) prompts)
-      (cl-call-next-method))))
+  (if (gptel--model-capable-p 'responses-api gptel-model)
+      (gptel--inject-media (gptel--gh-responses-backend backend) prompts)
+    (cl-call-next-method)))
 
 ;;;###autoload
 (cl-defun gptel-make-gh-copilot
     (name &key curl-args request-params
-          (header (lambda ()
-                    (gptel--gh-auth)
-                    `(("openai-intent" . "conversation-panel")
-                      ("authorization" . ,(concat "Bearer "
-                                           (plist-get (gptel--gh-token gptel-backend) :token)))
-                      ("x-request-id" . ,(gptel--gh-uuid))
-                      ("vscode-sessionid" . ,(or (gptel--gh-sessionid gptel-backend) ""))
-                      ("vscode-machineid" . ,(or (gptel--gh-machineid gptel-backend) ""))
-                      ,@(when (and gptel-track-media
-                                   (gptel--model-capable-p 'media))
-                          `(("copilot-vision-request" . "true")))
-                      ("copilot-integration-id" . "vscode-chat"))))
+          (header
+           (lambda (info) (gptel--gh-auth)
+             `(("openai-intent" . "conversation-panel")
+               ("authorization" . ,( concat "Bearer "
+                                     (plist-get (gptel--gh-token gptel-backend) :token)))
+               ("x-initiator"  . ,(or (plist-get info :gh-initiator) ;tool call return turn
+                                      (prog1 "user"                  ;user turn
+                                        (plist-put info :gh-initiator "agent"))))
+               ("x-request-id" . ,(gptel--gh-uuid))
+               ("vscode-sessionid" . ,(or (gptel--gh-sessionid gptel-backend) ""))
+               ("vscode-machineid" . ,(or (gptel--gh-machineid gptel-backend) ""))
+               ,@(when (and gptel-track-media
+                            (gptel--model-capable-p 'media))
+                   `(("copilot-vision-request" . "true")))
+               ("copilot-integration-id" . "vscode-chat"))))
           (host "api.githubcopilot.com")
           (protocol "https")
           (endpoint "/chat/completions")
@@ -516,9 +508,9 @@ parameters (as plist keys) and values supported by the API.  Use
 these to set parameters that gptel does not provide user options
 for."
   (declare (indent 1))
-  (let* ((url (lambda ()
+  (let* ((url (lambda (_info)
                 (concat protocol "://" host
-                        (if (gptel--model-capable-p 'response-api)
+                        (if (gptel--model-capable-p 'responses-api gptel-model)
                             "/v1/responses" endpoint))))
          (backend (gptel--make-gh
                    :name name
