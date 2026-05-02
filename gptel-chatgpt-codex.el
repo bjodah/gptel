@@ -255,6 +255,21 @@ Uses the dynamically bound `gptel-backend'."
       (push (cons "ChatGPT-Account-Id" account-id) headers))
     headers))
 
+;;; ---- Request payload ----
+
+(cl-defmethod gptel--request-data ((_backend gptel-openai-chatgpt) _prompts)
+  "JSON encode PROMPTS for ChatGPT Codex.
+
+The ChatGPT Codex endpoint requires the `instructions' field even when
+there is no system prompt, and rejects sampling parameters accepted by
+the public Responses API.  Adjust the shared Responses API payload for
+Codex requests."
+  (let ((data (cl-call-next-method)))
+    (unless (plist-member data :instructions)
+      (plist-put data :instructions ""))
+    (cl-remf data :temperature)
+    data))
+
 
 ;;; ---- Login command ----
 
