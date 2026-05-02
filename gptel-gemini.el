@@ -45,13 +45,16 @@
   "Update token usage information from USAGE.
 USAGE is part of the response, INFO is the request plist."
   (when usage
-    (let* ((tokens (plist-get info :tokens))
-           (input (+ (plist-get usage :promptTokenCount)
-                     (or (plist-get tokens :input) 0)))
-           (output (+ (- (plist-get usage :totalTokenCount)
-                         (plist-get usage :promptTokenCount))
-                      (or (plist-get tokens :output) 0))))
-      (list :input input :output output))))
+    (let* ((input (or (plist-get usage :promptTokenCount) 0))
+           (output (- (or (plist-get usage :totalTokenCount) 0) input))
+           (cached (or (plist-get usage :cachedContentTokenCount) 0))
+           (tokens (list :input (- input cached) :output output :cached cached)))
+      ;; promptTokenCount includes the cached tokens, but we capture and display
+      ;; the two exclusively in the UI.
+      (plist-put info :tokens tokens)
+      (plist-put info :tokens-full
+                 (gptel--sum-plists (plist-get info :tokens-full)
+                                    tokens)))))
 
 ;; TODO: Using alt=sse in the query url generates an OpenAI style streaming
 ;; response, with more immediate updates.  Maybe we should switch to that and
@@ -89,9 +92,7 @@ list."
          (stop-reason (plist-get cand0 :finishReason)))
     (when stop-reason
       (plist-put info :stop-reason stop-reason)
-      (when (string= stop-reason "STOP")
-        (plist-put info :tokens (gptel--gemini-update-tokens
-                                 (plist-get response :usageMetadata) info))))
+      (gptel--gemini-update-tokens (plist-get response :usageMetadata) info))
     (cl-loop
      for part across parts
      for tx = (plist-get part :text)
@@ -152,7 +153,7 @@ list."
     (when gptel-temperature
       (setq params
             (plist-put params
-                       :temperature (max gptel-temperature 1.0))))
+                       :temperature (max 0.0 gptel-temperature))))
     (when gptel-max-tokens
       (setq params
             (plist-put params
@@ -627,8 +628,11 @@ source:
 
 ;;;###autoload
 (cl-defun gptel-make-gemini
-    (name &key curl-args header key request-params
+    (name &key curl-args key request-params
           (stream nil)
+          (header
+           (lambda (_info) (when-let* ((key (gptel--get-api-key)))
+                        `(("X-goog-api-key" . ,key)))))
           (host "generativelanguage.googleapis.com")
           (protocol "https")
           (models gptel--gemini-models)
@@ -697,18 +701,17 @@ for."
                   :stream stream
                   :request-params request-params
                   :key key
-                  :url (lambda ()
+                  :url (lambda (_info)
                          (let ((method
                                 (if (and stream gptel-use-curl gptel-stream)
                                     "streamGenerateContent"
                                   "generateContent")))
-                           (format "%s://%s%s/%s:%s?key=%s"
+                           (format "%s://%s%s/%s:%s"
                                    protocol
                                    host
                                    endpoint
                                    gptel-model
-                                   method
-                                   (gptel--get-api-key)))))))
+                                   method))))))
     (prog1 backend
       (setf (alist-get name gptel--known-backends
                        nil nil #'equal)
@@ -716,3 +719,7 @@ for."
 
 (provide 'gptel-gemini)
 ;;; gptel-gemini.el ends here
+
+;; Local Variables:
+;; byte-compile-warnings: (not docstrings)
+;; End:

@@ -27,30 +27,28 @@
 (require 'cl-lib)
 (require 'map)
 (require 'gptel-request)
+(require 'gptel-openai)
 
 (defvar gptel-mode)
 (declare-function gptel-context--collect-media "gptel-context")
 
-;;; OpenAI (ChatGPT)
-(cl-defstruct (gptel-openai-responses (:constructor gptel--make-openai-responses)
-                                      (:copier nil)
-                                      (:include gptel-backend)))
-
-
+;;; OpenAI Responses
 (defun gptel--openai-responses-update-tokens (usage info)
   "Update token usage information from USAGE.
 USAGE is part of the response, INFO is the request plist."
   (when usage
-    (let* ((tokens (plist-get info :tokens))
-           (input (+ (or (plist-get usage :input_tokens) 0)
-                     (or (plist-get tokens :input) 0)))
-           (output (+ (or (plist-get usage :output_tokens) 0)
-                      (or (plist-get tokens :output) 0)))
-           (cached (+ (or (map-nested-elt
-                           usage '(:input_tokens_details :cached_tokens))
-                          0)
-                      (or (plist-get tokens :cached) 0))))
-      (list :input input :output output :cached cached))))
+    (let ((input (or (plist-get usage :input_tokens) 0))
+          (output (or (plist-get usage :output_tokens) 0))
+          (cached (or (map-nested-elt
+                       usage '(:input_tokens_details :cached_tokens))
+                      0)))
+      ;; prompt_tokens includes the cached tokens, but we capture and display
+      ;; the two exclusively in the UI.
+      (let ((tokens (list :input (- input cached) :output output :cached cached)))
+        (plist-put info :tokens tokens) ;Tokens for this turn
+        (plist-put info :tokens-full    ;Tokens for full request
+                   (gptel--sum-plists (plist-get info :tokens-full)
+                                      tokens))))))
 
 (cl-defmethod gptel-curl--parse-stream ((_backend gptel-openai-responses) info)
   "Parse an OpenAI Responses API data stream.
@@ -93,11 +91,13 @@ information if the stream contains it."
                               (cons tool-call (plist-get info :tool-use)))
                    (plist-put info :partial_json nil)))
                 ;; Reasoning content
-                ("response.reasoning_summary_text.delta"
+                ((or "response.reasoning_summary_text.delta"
+                     "response.reasoning.delta")
                  (when-let* ((delta (plist-get data :delta)))
                    (plist-put info :reasoning
                               (concat (plist-get info :reasoning) delta))))
-                ("response.reasoning_summary_text.done"
+                ((or "response.reasoning_summary_text.done"
+                     "response.reasoning.done")
                  (plist-put info :reasoning-block t))
                 ;; NOTE: backend tools are not supported in gptel yet, this
                 ;; parsing is for the future
@@ -130,8 +130,8 @@ information if the stream contains it."
                             tool-use)))
                  (when-let* ((resp (plist-get data :response)))
                    (plist-put info :stop-reason (plist-get resp :status))
-                   (plist-put info :tokens (gptel--openai-responses-update-tokens
-                                            (plist-get resp :usage) info))))))))
+                   (gptel--openai-responses-update-tokens
+                    (plist-get resp :usage) info)))))))
       (error (goto-char (match-beginning 0))))
     (apply #'concat (nreverse content-strs))))
 
@@ -142,8 +142,7 @@ Mutate state INFO with response metadata."
         (content-strs) (tool-use) (tool-calls))
     ;; Store usage info
     (plist-put info :stop-reason (plist-get response :status))
-    (plist-put info :tokens (gptel--openai-responses-update-tokens
-                             (plist-get response :usage) info))
+    (gptel--openai-responses-update-tokens (plist-get response :usage) info)
     ;; Process output items
     (cl-loop
      for item across output-items
@@ -159,7 +158,8 @@ Mutate state INFO with response metadata."
            if (equal part-type "output_text")
            do (push (plist-get part :text) content-strs)
            else if (equal part-type "refusal")
-           do (push (format "[Refused: %s]" (plist-get part :refusal)) content-strs))))
+           do (push (format "[Refused: %s]" (plist-get part :refusal))
+                    content-strs))))
        ;; Function call from model (user-defined tools)
        ("function_call"
         (push item tool-calls)
@@ -169,6 +169,15 @@ Mutate state INFO with response metadata."
                             (gptel--json-read-string
                              (plist-get item :arguments))))
               tool-use))
+       ;; Reasoning summary
+       ("reasoning"
+        (cl-loop with summary = (plist-get item :summary)
+                 with content = (plist-get item :content)
+                 for s across
+                 (if (length= content 0) summary content)
+                 collect (plist-get s :text) into reasoning
+                 finally do
+                 (plist-put info :reasoning (apply #'concat reasoning))))
        ;; Web search results (server-side tool)
        ("web_search_call"
         (when-let* ((status (plist-get item :status))
@@ -184,20 +193,15 @@ Mutate state INFO with response metadata."
            for result across results
            for result-type = (plist-get result :type)
            if (equal result-type "logs")
-           do (push (format "\n```\n%s\n```" (plist-get result :logs)) content-strs))))
+           do (push (format "\n```\n%s\n```" (plist-get result :logs))
+                    content-strs))))
        ;; File search results (server-side tool)
        ("file_search_call"
         (when-let* ((status (plist-get item :status))
                     ((equal status "completed"))
                     (results (plist-get item :results)))
-          (push (format "\n[File search: %d results]" (length results)) content-strs)))
-       ;; Reasoning summary
-       ("reasoning"
-        (when-let* ((summary (plist-get item :summary)))
-          (cl-loop for s across summary
-                   do (plist-put info :reasoning
-                                 (concat (plist-get info :reasoning)
-                                         (plist-get s :text))))))))
+          (push (format "\n[File search: %d results]" (length results))
+                content-strs)))))
     ;; Store tool calls for user-defined function tools
     (when tool-use
       (plist-put info :tool-use (nreverse tool-use))
@@ -218,15 +222,12 @@ Mutate state INFO with response metadata."
             ;; previous_response_id. Each request contains full context.
             :store :json-false
             :stream ,(or gptel-stream :json-false)))
-        (reasoning-model-p
-         (memq gptel-model '(o1 o1-preview o1-mini o3-mini o3 o4-mini
-                                gpt-5 gpt-5-mini gpt-5-nano gpt-5.1 gpt-5.2
-                                gpt-5.3-chat-latest gpt-5.4))))
+        (o-model-p (memq gptel-model '(o1 o1-preview o1-mini o3-mini o3 o4-mini))))
     ;; System message becomes instructions
     (when gptel--system-message
       (plist-put prompts-plist :instructions gptel--system-message))
     ;; Temperature
-    (when (and gptel-temperature (not reasoning-model-p))
+    (when (and gptel-temperature (not o-model-p))
       (plist-put prompts-plist :temperature gptel-temperature))
     ;; Max tokens
     (when gptel-max-tokens
@@ -355,28 +356,6 @@ Returns prompts in Responses API format with function_call_output items."
       :call_id (plist-get tool-call :id)
       :output (plist-get tool-call :result)))
    tool-use))
-
-(defun gptel--openai-format-tool-id (tool-id)
-  "Format TOOL-ID for OpenAI.
-
-If the ID has the format used by a different backend, use as-is."
-  (unless tool-id
-    (setq tool-id (substring
-                   (md5 (format "%s%s" (random) (float-time)))
-                   nil 24)))
-  (if (or (string-prefix-p "toolu_" tool-id) ;#747
-          (string-prefix-p "call_"  tool-id))
-      tool-id
-    (format "call_%s" tool-id)))
-
-(defun gptel--openai-unformat-tool-id (tool-id)
-  "Return the raw tool ID for TOOL-ID.
-
-If TOOL-ID has the OpenAI-style prefix call_, return the part after
-that prefix.  Otherwise return TOOL-ID unchanged."
-  (or (and (string-match "call_\\(.+\\)" tool-id)
-           (match-string 1 tool-id))
-      tool-id))
 
 (cl-defmethod gptel--inject-prompt
   ((_backend gptel-openai-responses) data new-prompt &optional position)
@@ -531,137 +510,13 @@ Media files, if present, are placed in `gptel-context'."
                    (t current))))
         (plist-get (car prompts) :content))))
 
-(defconst gptel--openai-responses-models
-  '((gpt-4o-mini
-     :description "Cheap model for fast tasks; cheaper & more capable than GPT-3.5 Turbo"
-     :capabilities (media tool-use json url responses-api)
-     :mime-types ("image/jpeg" "image/png" "image/gif" "image/webp")
-     :context-window 128
-     :input-cost 0.15
-     :output-cost 0.60
-     :cutoff-date "2023-10")
-    (gpt-4o
-     :description "Advanced model for complex tasks; cheaper & faster than GPT-Turbo"
-     :capabilities (media tool-use json url responses-api)
-     :mime-types ("image/jpeg" "image/png" "image/gif" "image/webp")
-     :context-window 128
-     :input-cost 2.50
-     :output-cost 10
-     :cutoff-date "2023-10")
-    (gpt-4.1
-     :description "Flagship model for complex tasks"
-     :capabilities (media tool-use json url responses-api)
-     :mime-types ("image/jpeg" "image/png" "image/gif" "image/webp")
-     :context-window 1024
-     :input-cost 2.0
-     :output-cost 8.0
-     :cutoff-date "2024-05")
-    (gpt-4.1-mini
-     :description "Balance between intelligence, speed and cost"
-     :capabilities (media tool-use json url responses-api)
-     :mime-types ("image/jpeg" "image/png" "image/gif" "image/webp")
-     :context-window 1024
-     :input-cost 0.4
-     :output-cost 1.6)
-    (gpt-4.1-nano
-     :description "Fastest, most cost-effective GPT-4.1 model"
-     :capabilities (media tool-use json url responses-api)
-     :mime-types ("image/jpeg" "image/png" "image/gif" "image/webp")
-     :context-window 1024
-     :input-cost 0.10
-     :output-cost 0.40
-     :cutoff-date "2024-05")
-    (gpt-5
-     :description "Flagship model for coding, reasoning, and agentic tasks across domains"
-     :capabilities (media tool-use json url responses-api)
-     :mime-types ("image/jpeg" "image/png" "image/gif" "image/webp")
-     :context-window 400
-     :input-cost 1.25
-     :output-cost 10
-     :cutoff-date "2024-09")
-    (gpt-5-mini
-     :description "Faster, more cost-efficient version of GPT-5"
-     :capabilities (media tool-use json url responses-api)
-     :mime-types ("image/jpeg" "image/png" "image/gif" "image/webp")
-     :context-window 400
-     :input-cost 0.25
-     :output-cost 2.0
-     :cutoff-date "2024-09")
-    (gpt-5-nano
-     :description "Fastest, cheapest version of GPT-5"
-     :capabilities (media tool-use json url responses-api)
-     :mime-types ("image/jpeg" "image/png" "image/gif" "image/webp")
-     :context-window 400
-     :input-cost 0.05
-     :output-cost 0.40
-     :cutoff-date "2024-09")
-    (gpt-5.1
-     :description "The best model for coding and agentic tasks"
-     :capabilities (media tool-use json url responses-api)
-     :mime-types ("image/jpeg" "image/png" "image/gif" "image/webp")
-     :context-window 400
-     :input-cost 1.25
-     :output-cost 10
-     :cutoff-date "2024-09")
-    (gpt-5.2
-     :description "The best model for coding and agentic tasks"
-     :capabilities (media tool-use json url responses-api)
-     :mime-types ("image/jpeg" "image/png" "image/gif" "image/webp")
-     :context-window 400
-     :input-cost 1.75
-     :output-cost 14
-     :cutoff-date "2025-08")
-    (gpt-5.3-chat-latest
-     :description "Answers right away"
-     :capabilities (media tool-use json url responses-api)
-     :mime-types ("image/jpeg" "image/png" "image/gif" "image/webp")
-     :context-window 400
-     :input-cost 1.75
-     :output-cost 14
-     :cutoff-date "2025-08")
-    (gpt-5.4
-     :description "The best model for coding and agentic tasks"
-     :capabilities (media tool-use json url responses-api)
-     :mime-types ("image/jpeg" "image/png" "image/gif" "image/webp")
-     :context-window 400
-     :input-cost 1.75
-     :output-cost 14
-     :cutoff-date "2025-08")
-    (o3
-     :description "Well-rounded and powerful model across domains"
-     :capabilities (reasoning media tool-use json url responses-api)
-     :mime-types ("image/jpeg" "image/png" "image/gif" "image/webp")
-     :context-window 200
-     :input-cost 2
-     :output-cost 8
-     :cutoff-date "2024-05")
-    (o3-mini
-     :description "High intelligence at the same cost and latency targets of o1-mini"
-     :context-window 200
-     :input-cost 1.10
-     :output-cost 4.40
-     :cutoff-date "2023-10"
-     :capabilities (reasoning tool-use json responses-api))
-    (o4-mini
-     :description "Fast, effective reasoning with efficient performance in coding and visual tasks"
-     :capabilities (reasoning media tool-use json url responses-api)
-     :mime-types ("image/jpeg" "image/png" "image/gif" "image/webp")
-     :context-window 200
-     :input-cost 1.10
-     :output-cost 4.40
-     :cutoff-date "2024-05"))
-  "List of OpenAI models supporting the Responses API.
-Same format as `gptel--openai-models' but filtered for models
-that work well with the Responses API and include the
-`responses-api' capability.")
-
 ;;;###autoload
 (cl-defun gptel-make-openai-responses
-    (name &key curl-args (models gptel--openai-responses-models)
+    (name &key curl-args (models gptel--openai-models)
           stream key request-params
           (header
-           (lambda () (when-let* ((key (gptel--get-api-key)))
-                   `(("Authorization" . ,(concat "Bearer " key))))))
+           (lambda (_info) (when-let* ((key (gptel--get-api-key)))
+                        `(("Authorization" . ,(concat "Bearer " key))))))
           (host "api.openai.com")
           (protocol "https")
           (endpoint "/v1/responses"))
@@ -685,7 +540,7 @@ information, in the form
  (model-name . plist)
 
 For a list of currently recognized plist keys, see
-`gptel--openai-responses-models'.
+`gptel--openai-models'.
 
 STREAM is a boolean to toggle streaming responses, defaults to
 false.
