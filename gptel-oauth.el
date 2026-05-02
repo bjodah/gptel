@@ -102,7 +102,7 @@ PARAMS is an alist of (KEY . VALUE) string pairs."
 (cl-defun gptel-oauth-request (url &key (method 'post) data content-type headers)
   "Retrieve URL synchronously and return (:status N :body PLIST :raw STRING).
 
-METHOD is a symbol, typically 'get or 'post.
+METHOD is a symbol, typically \='get or \='post.
 CONTENT-TYPE defaults to \"application/json\".  When CONTENT-TYPE is
 \"application/x-www-form-urlencoded\", DATA should be an already-encoded string.
 When CONTENT-TYPE is \"application/json\", DATA should be a plist.
