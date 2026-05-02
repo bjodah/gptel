@@ -244,7 +244,7 @@ Returns the token plist.  Signals `user-error' if no token exists."
 
 ;;; ---- Header function ----
 
-(defun gptel--openai-chatgpt-header ()
+(defun gptel--openai-chatgpt-header (_info)
   "Return headers for ChatGPT OAuth requests.
 Uses the dynamically bound `gptel-backend'."
   (let* ((token (gptel--openai-chatgpt-ensure-token gptel-backend))
