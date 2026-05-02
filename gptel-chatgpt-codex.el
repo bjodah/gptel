@@ -66,7 +66,15 @@
 
 ;; Model metadata is approximate; revise after manual traces.
 (defcustom gptel--openai-chatgpt-models
-  '((gpt-5\.4
+  '((gpt-5.5
+     :description "GPT-5.5 via ChatGPT Codex"
+     :capabilities (media tool-use json url responses-api)
+     :mime-types ("image/jpeg" "image/png" "image/gif" "image/webp")
+     :context-window 400
+     :input-cost 0
+     :output-cost 0
+     :cutoff-date "2026-04")
+    (gpt-5.4
      :description "GPT-5.4 via ChatGPT Codex"
      :capabilities (responses-api tool-use media json url)
      :mime-types ("image/jpeg" "image/png" "image/gif" "image/webp")
@@ -74,7 +82,7 @@
      :input-cost 0
      :output-cost 0
      :cutoff-date "2025-03")
-    (gpt-5\.3-codex
+    (gpt-5.3-codex
      :description "GPT-5.3 Codex via ChatGPT subscription"
      :capabilities (responses-api tool-use media json url)
      :mime-types ("image/jpeg" "image/png" "image/gif" "image/webp")
